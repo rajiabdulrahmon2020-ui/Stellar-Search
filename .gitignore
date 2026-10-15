@@ -1,8 +1,6 @@
 node_modules/
 dist/
 coverage/
-.env
-.env.production
 .env.*.local
 *.local
 .DS_Store
@@ -21,3 +19,4 @@ sbom.cyclonedx.json
 osv-results.json
 osv-results.sarif
 logs/
+config.bat
