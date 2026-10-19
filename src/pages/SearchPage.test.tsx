@@ -10,8 +10,11 @@ const mockWalletConnected: WalletState = {
   network: 'Testnet',
   xlmBalance: '100.0',
   usdcBalance: '10.0',
+  hasUsdcTrustline: true,
   loading: false,
   error: null,
+  accountExists: true,
+  accountStatus: 'funded',
 }
 
 describe('SearchPage component', () => {
@@ -79,7 +82,7 @@ describe('SearchPage component', () => {
 
     const searchOriginalBtn = screen.getByTestId('search-original-btn')
     fireEvent.click(searchOriginalBtn)
-    expect(handleSearch).toHaveBeenCalledWith('stelarr blockchan', undefined)
+    expect(handleSearch).toHaveBeenCalledWith('stelarr blockchan', undefined, 5, 'web')
   })
 
   it('renders "Did you mean?" suggestion banner and allows accepting or dismissing', () => {
@@ -137,5 +140,119 @@ describe('SearchPage component', () => {
 
     const searchInput = screen.getByRole('textbox', { name: /search query/i })
     expect(searchInput).toBeInTheDocument()
+  })
+
+  it('preserves the active freshness filter for AI suggestions', async () => {
+    const search = vi.fn()
+    const session: SearchSession = {
+      query: 'stellar', results: [{ id: '1', title: 'Result', url: 'https://example.com', description: 'Description', source: 'example.com', relevanceScore: 1 }],
+      txHash: 'tx', paidAmount: '0.001', status: 'complete', suggestions: ['soroban payments'],
+    }
+    render(<SearchPage wallet={mockWalletConnected} onConnectWallet={vi.fn()} session={session} search={search} reset={vi.fn()} />)
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'pw' } })
+    fireEvent.change(screen.getByRole('textbox', { name: /search query/i }), { target: { value: 'stellar' } })
+    fireEvent.submit(screen.getByRole('search'))
+    fireEvent.click(await screen.findByRole('button', { name: 'soroban payments' }))
+    expect(search).toHaveBeenCalledWith('stellar', 'pw', 5, 'web')
+    expect(search).toHaveBeenCalledWith('soroban payments', 'pw', 5, 'web')
+  })
+})
+
+describe('SearchPage focus management (#150)', () => {
+  // Must match EXPECTED_WALLET_NETWORK so the search input is not disabled.
+  const focusedWallet: WalletState = { ...mockWalletConnected, network: 'TESTNET' }
+
+  const baseSession: SearchSession = {
+    query: 'stellar blockchain',
+    results: [],
+    txHash: null,
+    paidAmount: null,
+    status: 'searching',
+    suggestions: [],
+  }
+
+  const result = {
+    id: '1',
+    title: 'Stellar Foundation',
+    url: 'https://stellar.org',
+    description: 'Official site',
+    source: 'stellar.org',
+    relevanceScore: 1,
+  }
+
+  const renderPage = (session: SearchSession) =>
+    render(
+      <SearchPage
+        wallet={focusedWallet}
+        onConnectWallet={vi.fn()}
+        session={session}
+        search={vi.fn()}
+        reset={vi.fn()}
+      />
+    )
+
+  const rerenderPage = (rerender: any, session: SearchSession) =>
+    rerender(
+      <SearchPage
+        wallet={focusedWallet}
+        onConnectWallet={vi.fn()}
+        session={session}
+        search={vi.fn()}
+        reset={vi.fn()}
+      />
+    )
+
+  it('moves focus to the results heading when an async search completes', () => {
+    const { rerender } = renderPage(baseSession)
+
+    rerenderPage(rerender, { ...baseSession, status: 'complete', results: [result], txHash: 'tx_1', paidAmount: '0.001' })
+
+    const heading = screen.getByRole('heading', { level: 2 })
+    expect(heading).toHaveTextContent(/RESULTS/i)
+    expect(document.activeElement).toBe(heading)
+  })
+
+  it('moves focus to a results heading even when the search returned zero results', () => {
+    const { rerender } = renderPage(baseSession)
+    rerenderPage(rerender, { ...baseSession, status: 'complete', results: [] })
+
+    const heading = screen.getByRole('heading', { level: 2 })
+    expect(heading).toHaveTextContent(/0 RESULTS/i)
+    expect(document.activeElement).toBe(heading)
+  })
+
+  it('moves focus to the error alert when a search fails', () => {
+    const { rerender } = renderPage(baseSession)
+    rerenderPage(rerender, { ...baseSession, status: 'error', error: 'Payment failed.' })
+
+    const alert = screen.getByRole('alert')
+    expect(alert).toHaveTextContent(/Payment failed/)
+    expect(document.activeElement).toBe(alert)
+  })
+
+  it('never steals focus while the user is typing in the search input', () => {
+    const { rerender } = renderPage({ ...baseSession, status: 'complete', results: [result] })
+
+    // Focus the input as if the user clicked into it to type a new query.
+    const input = screen.getByRole('textbox', { name: /search query/i })
+    input.focus()
+    fireEvent.change(input, { target: { value: 'next search' } })
+
+    // No status transition happened — focus must stay on the input.
+    expect(document.activeElement).toBe(input)
+
+    // Even while the search runs (searching), focus is not hijacked by results.
+    rerenderPage(rerender, { ...baseSession, status: 'searching', results: [] })
+    expect(document.activeElement).not.toBe(screen.queryByRole('heading', { level: 2 }))
+    expect(document.activeElement).not.toBe(screen.queryByRole('alert'))
+  })
+
+  it('moves focus to the results heading again after a follow-up search completes', () => {
+    const { rerender } = renderPage({ ...baseSession, status: 'complete', results: [result] })
+
+    rerenderPage(rerender, { ...baseSession, status: 'searching', results: [] })
+    rerenderPage(rerender, { ...baseSession, status: 'complete', results: [result, { ...result, id: '2' }] })
+
+    expect(document.activeElement).toBe(screen.getByRole('heading', { level: 2 }))
   })
 })

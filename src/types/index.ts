@@ -1,73 +1,87 @@
-export type PaymentStep = 1 | 2 | 3 | 4 | 5 | 6
+export type { WalletState, StellarTransaction } from '../hooks/useFreighterWallet'
+export type { SearchSession, SearchResult } from '../hooks/useSearch'
+import type { SearchResult } from '../hooks/useSearch'
 
-export interface SearchResult {
-  id: string
-  title: string
-  url: string
-  description: string
-  source: string
-  relevanceScore: number
-  publishedAt?: string
+/**
+ * Common metadata included in search responses across endpoints.
+ */
+export interface BaseSearchResponse {
+  query: string
+  count: number
+  network: string
+  paidAmount: string
+  currency: string
+  txHash?: string | null
+  latencyMs: number
 }
 
-export interface SearchSession {
+// ─── Answer Box ────────────────────────────────────────────────────────────
+/** Direct factual answer to a query (e.g., "what is X") */
+export interface AnswerBoxSource {
+  title: string
+  link: string
+  displayLink?: string
+}
+
+export interface AnswerBox {
+  title: string
+  answer: string
+  source: AnswerBoxSource
+}
+
+// ─── Knowledge Graph ───────────────────────────────────────────────────────
+/** Structured data about entities (people, places, things) */
+export interface KnowledgeGraphAttribute {
+  name: string
+  value: string
+}
+
+export interface KnowledgeGraphLink {
+  title: string
+  link: string
+}
+
+export interface KnowledgeGraph {
+  title: string
+  type?: string
+  description?: string
+  attributes?: KnowledgeGraphAttribute[]
+  imageUrl?: string
+  website?: string
+  links?: KnowledgeGraphLink[]
+}
+
+// ─── Search Response ───────────────────────────────────────────────────────
+export interface SearchResponse {
   query: string
   originalQuery?: string
   executedQuery?: string
   suggestedQuery?: string
   isCorrected?: boolean
   results: SearchResult[]
-  txHash: string | null
-  paidAmount: string | null
-  status: 'idle' | 'searching' | 'done' | 'error' | 'complete'
-  step?: PaymentStep
-  error?: string
+  count: number
+  answerBox?: AnswerBox
+  knowledgeGraph?: KnowledgeGraph
+  network: string
+  paidAmount: string
+  currency: string
+  txHash?: string | null
+  latencyMs: number
   suggestions?: string[]
-  durationMs?: number
+  peopleAlsoAsk?: PeopleAlsoAskResult[]
 }
 
-export interface WalletState {
-  publicKey: string | null
-  connected: boolean
-  network: string
-  xlmBalance: string
-  usdcBalance: string
-  /** True once the account has a USDC trustline (a balance line exists for
-   *  it), independent of whether that balance is currently 0. Distinct
-   *  from `usdcBalance === '0'`, which is also true for an account with a
-   *  trustline but nothing funded into it yet (#342). */
-  hasUsdcTrustline: boolean
-  loading: boolean
-  error: string | null
+export interface PeopleAlsoAskResult {
+  question: string
+  answer: string
+  source: string
+  url: string
 }
 
-export interface StellarTransaction {
-  id: string
-  hash: string
-  type: string
-  amount: string
-  asset: string
-  from: string
-  to: string
-  timestamp: string
-  memo?: string
-}
+// Alias for compatibility
+export type WebSearchResponse = SearchResponse
 
-export interface SearchReceipt {
-  txHash: string
-  query: string
-  amount: string
-  timestamp: string
-  network: string
-}
-
-export interface ApiStat {
-  totalQueries: number
-  totalUsdcSettled: string
-  avgLatencyMs: number
-  uptime: string
-}
-
+// ─── Image Search Response ─────────────────────────────────────────────────
 export interface ImageResult {
   id: string
   title: string
@@ -79,6 +93,21 @@ export interface ImageResult {
   height?: number
 }
 
+export interface ImageSearchResponse {
+  query: string
+  results: ImageResult[]
+  count: number
+  network: string
+  paidAmount: string
+  currency: string
+  txHash?: string | null
+  latencyMs: number
+}
+
+// Alias for compatibility
+export type ImageResponse = ImageSearchResponse
+
+// ─── News Search Response ──────────────────────────────────────────────────
 export interface NewsResult {
   id: string
   title: string
@@ -89,33 +118,6 @@ export interface NewsResult {
   imageUrl?: string
 }
 
-export interface SearchResponse {
-  query: string
-  originalQuery?: string
-  executedQuery?: string
-  suggestedQuery?: string
-  isCorrected?: boolean
-  results: SearchResult[]
-  count: number
-  network: string
-  paidAmount: string
-  currency: string
-  txHash: string | null
-  latencyMs: number
-  suggestions?: string[]
-}
-
-export interface ImageSearchResponse {
-  query: string
-  results: ImageResult[]
-  count: number
-  network: string
-  paidAmount: string
-  currency: string
-  txHash: string | null
-  latencyMs: number
-}
-
 export interface NewsSearchResponse {
   query: string
   results: NewsResult[]
@@ -123,195 +125,82 @@ export interface NewsSearchResponse {
   network: string
   paidAmount: string
   currency: string
-  txHash: string | null
+  txHash?: string | null
   latencyMs: number
+}
+
+// Alias for compatibility
+export type NewsResponse = NewsSearchResponse
+
+// ─── API Error Response ────────────────────────────────────────────────────
+export enum SerperErrorCode {
+  AUTH_FAILURE = 'SERPER_AUTH_FAILURE',
+  QUOTA_EXCEEDED = 'SERPER_QUOTA_EXCEEDED',
+  RATE_LIMITED = 'SERPER_RATE_LIMITED',
+  PROVIDER_ERROR = 'SERPER_PROVIDER_ERROR',
+  NETWORK_ERROR = 'SERPER_NETWORK_ERROR',
 }
 
 export interface ApiErrorResponse {
   error: string
+  providerCode?: SerperErrorCode
+  credit?: CreditReceipt
 }
 
-// Aliases for response types
-export type WebSearchResponse = SearchResponse
-export type ImageResponse = ImageSearchResponse
-export type NewsResponse = NewsSearchResponse
+// Alias for compatibility
 export type ErrorResponse = ApiErrorResponse
 
-// ─── JSON Lines batch streaming (issue #325) ─────────────────────────────────
-
-export const BATCH_JSONL_VERSION = 1 as const
-export const MAX_BATCH_SIZE = 10
-export const MAX_BATCH_TOTAL_USDC = '0.01'
-
-export type BatchItemStatus = 'pending' | 'settled' | 'success' | 'error' | 'skipped'
-
-export interface BatchSearchRequest {
-  queries: string[]
-  count?: number
-  freshness?: 'pd' | 'pw' | 'pm'
-  idempotencyKey?: string
-}
-
-export type BatchJsonlEventType = 'quote' | 'settlement' | 'result' | 'error' | 'done'
-
-export interface BatchJsonlQuoteEvent {
-  v: typeof BATCH_JSONL_VERSION
-  type: 'quote'
-  requestId: string
-  totalQueries: number
-  pricePerQuery: string
-  totalAmount: string
-  currency: string
-  network: string
-  payTo: string
-  idempotencyKey?: string
-}
-
-export interface BatchJsonlSettlementEvent {
-  v: typeof BATCH_JSONL_VERSION
-  type: 'settlement'
-  requestId: string
-  paymentId: string | null
-  txHash: string | null
-  verified: boolean
-  settledAt: string
-}
-
-export interface BatchJsonlResultEvent {
-  v: typeof BATCH_JSONL_VERSION
-  type: 'result'
-  requestId: string
-  index: number
+// ─── Credit Receipt ───────────────────────────────────────────────────────
+export interface CreditReceipt {
+  id?: string
+  creditId: string
+  receiptId: string
+  route: string
   query: string
-  originalQuery?: string
-  executedQuery?: string
-  suggestedQuery?: string
-  isCorrected?: boolean
-  results: SearchResult[]
-  count: number
-  latencyMs: number
-  paidAmount: string
-  currency: string
-  network: string
-  txHash: string | null
-}
-
-export interface BatchJsonlErrorEvent {
-  v: typeof BATCH_JSONL_VERSION
-  type: 'error'
-  requestId: string
-  index: number
-  query: string
-  error: string
-  code: string
-}
-
-export interface BatchJsonlDoneEvent {
-  v: typeof BATCH_JSONL_VERSION
-  type: 'done'
-  requestId: string
-  succeeded: number
-  failed: number
-  totalUsdcSpent: string
-  aggregateLatencyMs: number
-  completedAt: string
-}
-
-export type BatchJsonlEvent =
-  | BatchJsonlQuoteEvent
-  | BatchJsonlSettlementEvent
-  | BatchJsonlResultEvent
-  | BatchJsonlErrorEvent
-  | BatchJsonlDoneEvent
-
-// ─── Asynchronous paid search jobs with webhooks (issue #324) ─────────────────
-
-export type JobStatus = 'pending' | 'settling' | 'running' | 'completed' | 'failed' | 'cancelled'
-
-export interface SearchJobRequest {
-  query: string
-  count?: number
-  freshness?: 'pd' | 'pw' | 'pm'
-  webhookUrl?: string
-  webhookSecret?: string
-  idempotencyKey?: string
-}
-
-export interface SearchJob {
-  id: string
-  query: string
-  count: number
-  freshness?: string
-  status: JobStatus
-  createdAt: string
-  updatedAt: string
-  paymentId: string | null
-  txHash: string | null
-  verified: boolean
-  paidAmount: string
-  currency: string
-  network: string
-  result?: SearchResponse
-  error?: string
-  webhookUrl?: string
-  webhookSecret?: string
-  idempotencyKey?: string
-  attempts: number
-  statusUrl: string
-}
-
-export interface SearchJobStatusResponse {
-  job: SearchJob
-  paymentVerified: boolean
-  statusUrl: string
-}
-
-export interface WebhookDeliveryState {
-  jobId: string
-  url: string
-  attempt: number
-  nextRetryAt?: string
-  lastError?: string
-  deliveredAt?: string
-  signature?: string
-}
-
-// ─── MCP resources & receipts (issue #326) ───────────────────────────────────
-
-export interface StoredReceipt {
-  id: string
-  query: string
-  txHash: string | null
   amount: string
   currency: string
-  network: string
+  reason: string
+  issuedAt: string
+  expiresAt: string
+  redeemed: boolean
+  redeemedAt: string | null
+}
+
+// ─── Search Receipt ───────────────────────────────────────────────────────
+export interface SearchReceipt {
+  txHash: string
+  query: string
+  amount: string
   timestamp: string
-  latencyMs: number
-  count: number
-}
-
-export interface CapabilityDoc {
-  name: string
-  version: string
   network: string
-  pricePerQuery: string
-  currency: string
-  contract: string
-  endpoints: Record<string, string>
-  mcpTools: string[]
-  mcpResources: string[]
-  mcpPrompts: string[]
+  asset?: string
+  destination?: string
 }
 
-// ─── Saved research: notes & tags (issue #305) ───────────────────────────────
-//
-// A user-curated bookmark of a search result, kept alongside (not instead
-// of) the ephemeral in-session `SearchResult` list. Persisted locally under
-// `stellarsearch_saved_research`, mirroring the existing `SearchReceipt`
-// localStorage pattern used by the Dashboard's audit log.
+// ─── Receipt Verification Types ───────────────────────────────────────────
+export type ReceiptVerificationStatus = 'confirmed' | 'mismatched' | 'unverified'
+
+export interface ReceiptVerificationDetail {
+  status: ReceiptVerificationStatus
+  ledgerSequence?: number
+  verifiedAt?: string
+  network?: string
+  txHash?: string
+  asset?: string
+  amount?: string
+  destination?: string
+  mismatches?: string[]
+  error?: string
+}
+
+// ─── Additional UI & Sitelink Types ───────────────────────────────────────
+export interface Sitelink {
+  title: string
+  link?: string
+  url?: string
+}
 
 export interface SavedResearchItem {
-  /** Stable id for this saved item — derived from the source result's id + query so re-saving the same result from the same query is idempotent. */
   id: string
   query: string
   title: string
@@ -321,4 +210,162 @@ export interface SavedResearchItem {
   savedAt: string
   notes: string
   tags: string[]
+}
+
+export type SearchMode = 'web' | 'images' | 'news'
+
+// x402 payment flow step numbers (1: Request -> 6: Result)
+export type PaymentStep = 1 | 2 | 3 | 4 | 5 | 6
+
+// ─── API Stats ─────────────────────────────────────────────────────────────
+export interface ApiStat {
+  totalQueries: number
+  totalUsdcSettled: string
+  avgLatencyMs: number
+  uptime: string
+}
+
+// ─── Batch JSONL Event Types ───────────────────────────────────────────────
+export interface BatchJsonlEvent {
+  v: 1
+  type: string
+  requestId: string
+}
+
+export interface BatchJsonlQuoteEvent extends BatchJsonlEvent {
+  type: 'quote'
+  query: string
+  totalQueries: number
+  totalAmount: string
+  currency: string
+  network: string
+}
+
+export interface BatchJsonlSettlementEvent extends BatchJsonlEvent {
+  type: 'settlement'
+  paymentId: string
+  txHash: string | null
+  verified: boolean
+  settledAt: string
+}
+
+export interface BatchJsonlResultEvent extends BatchJsonlEvent {
+  type: 'result'
+  index: number
+  query: string
+  originalQuery?: string
+  executedQuery?: string
+  suggestedQuery?: string
+  isCorrected?: boolean
+  results: SearchResult[]
+  count: number
+  answerBox?: AnswerBox
+  knowledgeGraph?: KnowledgeGraph
+  latencyMs: number
+  paidAmount: string
+  currency: string
+  network: string
+  txHash?: string | null
+}
+
+export interface BatchJsonlErrorEvent extends BatchJsonlEvent {
+  type: 'error'
+  index?: number
+  query?: string
+  error: string
+  code: string
+}
+
+export interface BatchJsonlDoneEvent extends BatchJsonlEvent {
+  type: 'done'
+  succeeded: number
+  failed: number
+  totalUsdcSpent: string
+  aggregateLatencyMs: number
+  completedAt: string
+}
+
+// ─── Job Types ─────────────────────────────────────────────────────────────
+export interface SearchJob {
+  id: string
+  query: string
+  statusUrl: string
+  status: JobStatus
+  createdAt: string
+  updatedAt?: string
+  completedAt?: string
+  paymentId?: string
+  txHash?: string | null
+  results?: SearchResult[]
+  result?: SearchResult[] // Alias for results
+  error?: string
+  verified?: boolean
+  webhookUrl?: string
+  webhookSecret?: string
+  count?: number
+}
+
+export type JobStatus = 'queued' | 'processing' | 'completed' | 'failed'
+
+// ─── Collections ────────────────────────────────────────────────────────────
+
+/** Current schema version. Bump when the shape of CollectionsStore changes. */
+export const COLLECTIONS_SCHEMA_VERSION = 1 as const
+
+/** Maximum total saved results across all collections per device. */
+export const COLLECTIONS_QUOTA_MAX = 500 as const
+
+/** Maximum number of named collections per device. */
+export const COLLECTIONS_MAX_COUNT = 50 as const
+
+/** localStorage key used by useCollections. */
+export const COLLECTIONS_STORAGE_KEY = 'stellarsearch_collections' as const
+
+/**
+ * A single paid search result saved into a collection.
+ * Extends SearchResult with the originating query and payment metadata
+ * so provenance is always available offline.
+ */
+export interface SavedResult {
+  /** Stable unique id (copied from SearchResult.id). */
+  id: string
+  /** Collection this result belongs to. */
+  collectionId: string
+  /** ISO-8601 timestamp of when the result was saved. */
+  savedAt: string
+  /** The search query that produced this result. */
+  query: string
+  /** x402 transaction hash of the paid search that produced this result. */
+  txHash: string | null
+  /** Stellar network the payment was settled on. */
+  network: string
+  /** Snapshot of the result at save time. */
+  result: SearchResult
+}
+
+/** A named, ordered collection of saved results. */
+export interface Collection {
+  /** UUID v4. */
+  id: string
+  /** User-chosen display name (1-100 chars). */
+  name: string
+  /** ISO-8601 creation timestamp. */
+  createdAt: string
+  /** ISO-8601 last-modified timestamp. */
+  updatedAt: string
+  /** Ordered list of saved result ids belonging to this collection. */
+  resultIds: string[]
+}
+
+/**
+ * Root object stored under COLLECTIONS_STORAGE_KEY.
+ * Version-tagged so future schema changes can migrate forward.
+ */
+export interface CollectionsStore {
+  /** Schema version — must equal COLLECTIONS_SCHEMA_VERSION to be trusted as-is. */
+  version: typeof COLLECTIONS_SCHEMA_VERSION
+  /** Map from collection id to Collection metadata. */
+  collections: Record<string, Collection>
+  /** Map from saved-result id to SavedResult. */
+  results: Record<string, SavedResult>
 }

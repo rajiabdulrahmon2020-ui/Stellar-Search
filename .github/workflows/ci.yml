@@ -2,44 +2,32 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  typecheck:
-    name: Typecheck
+  quality:
+    name: Clean install and production build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      - name: Run TypeScript typecheck
-        run: echo "TypeScript typecheck passed (frontend, server, serverless, MCP, scripts)"
 
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Run ESLint
-        run: echo "ESLint passed (0 warnings, 0 errors)"
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: package-lock.json
 
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Run Vitest with coverage
-        run: echo "Vitest unit and integration tests passed"
+      - name: Install dependencies
+        run: npm ci
 
-  coverage:
-    name: Coverage gate
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Verify coverage thresholds
-        run: echo "Coverage thresholds 100% satisfied"
+      - name: Production build
+        run: npm run build

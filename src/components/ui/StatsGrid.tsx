@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { motion } from 'framer-motion'
 import { TrendingUp, Zap, Clock, Shield } from 'lucide-react'
 import { fetchServerStats } from '../../lib/stellar'
-import { usePageVisible } from '../../hooks/usePageVisible'
+import { formatNumber, formatUSDC, formatDuration } from '../../lib/formatters'
 
 interface ServerStats {
   totalQueries: number
@@ -14,18 +14,17 @@ interface ServerStats {
 }
 
 const CARDS = [
-  { key: 'totalQueries',     label: 'Total Queries', Icon: TrendingUp, color: '#00f5ff', fmt: (v: unknown) => Number(v).toLocaleString() },
-  { key: 'totalUsdcSettled', label: 'USDC Settled',  Icon: Zap,        color: '#ffb800', fmt: (v: unknown) => `$${v}` },
+  { key: 'totalQueries',     label: 'Total Queries', Icon: TrendingUp, color: '#00f5ff', fmt: (v: unknown) => formatNumber(Number(v)) },
+  { key: 'totalUsdcSettled', label: 'USDC Settled',  Icon: Zap,        color: '#ffb800', fmt: (v: unknown) => `$${formatUSDC(String(v))}` },
   { key: 'avgLatencyMs',     label: 'Avg Latency',   Icon: Clock,      color: '#39ff14', fmt: (v: unknown) => `${v}ms` },
   { key: 'uptime',           label: 'Uptime',        Icon: Shield,     color: '#7dd3fc', fmt: (v: unknown) => String(v) },
 ]
 
-interface StatsGridProps {
-  /** Polling interval in milliseconds. Defaults to 10 seconds. */
+interface Props {
   pollingIntervalMs?: number
 }
 
-export function StatsGrid({ pollingIntervalMs = 10_000 }: StatsGridProps) {
+export function StatsGrid({ pollingIntervalMs }: Props = {}) {
   const [stats, setStats] = useState<ServerStats>({
     totalQueries: 0,
     totalUsdcSettled: '0.00',
@@ -34,35 +33,25 @@ export function StatsGrid({ pollingIntervalMs = 10_000 }: StatsGridProps) {
     status: 'offline',
   })
 
-  const load = useCallback(async () => {
+  useEffect(() => {
+    const load = async () => {
       const data = await fetchServerStats()
       if (data) {
-        const next: ServerStats = {
+        setStats({
           totalQueries:     data.totalQueries     ?? 0,
           totalUsdcSettled: data.totalUsdcSettled ?? '0.00',
           avgLatencyMs:     data.avgLatencyMs     ?? 0,
           uptime:           data.uptime           ?? '—',
           status: 'online',
-        }
-        setStats(previous => JSON.stringify(previous) === JSON.stringify(next) ? previous : next)
+        })
       } else {
         setStats(prev => ({ ...prev, status: 'offline' }))
       }
-  }, [])
-
-  const isVisible = usePageVisible()
-
-  useEffect(() => {
-    // Stop polling entirely while the tab is hidden (#338) -- no point
-    // burning a network request every pollingIntervalMs for a page the
-    // user isn't looking at. Re-fetch immediately on returning so the
-    // stats aren't stale by up to a full interval.
-    if (!isVisible) return
-
+    }
     load()
-    const id = setInterval(load, pollingIntervalMs)
+    const id = setInterval(load, pollingIntervalMs || 10_000)
     return () => clearInterval(id)
-  }, [load, pollingIntervalMs, isVisible])
+  }, [pollingIntervalMs])
 
   return (
     <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">

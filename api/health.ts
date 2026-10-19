@@ -1,21 +1,56 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
+import { getSerperBreakerState } from '../src/lib/serperClient'
+import { readServerConfig } from '../src/lib/config'
+import { applyServerlessHeaders } from '../src/lib/serverlessHeaders'
+import { USDC_CONTRACT_MAINNET, USDC_CONTRACT_TESTNET } from '../src/lib/constants'
+import { validateFacilitatorConfig } from '../src/lib/facilitatorValidation'
+import {
+  type ServerHealthResponse,
+  declareStatsUnsupported,
+  SERVERLESS_STATS_UNAVAILABLE_REASON,
+} from '../src/lib/serverHealth'
 
 export default function handler(req: VercelRequest, res: VercelResponse) {
-  const NETWORK = process.env.STELLAR_NETWORK || 'stellar:testnet'
-  const FACILITATOR_URL = process.env.FACILITATOR_URL || 'https://www.x402.org/facilitator'
-  const SERPER_API_KEY = process.env.SERPER_API_KEY
-  const GROQ_API_KEY = process.env.GROQ_API_KEY
-  const RECEIVING_ADDRESS = process.env.STELLAR_RECEIVING_ADDRESS
+  applyServerlessHeaders(res, req)
+  const config = readServerConfig()
+  const NETWORK = config.stellarNetwork
+  const FACILITATOR_URL = config.facilitatorUrl
 
-  res.json({
-    status: 'ok',
+  const currentValidation = validateFacilitatorConfig({
+    facilitatorUrl: FACILITATOR_URL,
     network: NETWORK,
-    pricePerQuery: '0.001 USDC',
+    scheme: 'exact',
+    asset: NETWORK === 'stellar:mainnet' ? USDC_CONTRACT_MAINNET : USDC_CONTRACT_TESTNET,
+  })
+
+  // This runtime reports configuration facts only. It deliberately does NOT
+  // report totalQueries / totalUsdcSettled / avgLatencyMs / uptime: a Vercel
+  // function is stateless and scales to zero, so an in-memory counter would
+  // describe one warm instance rather than the deployment. Declaring the gap
+  // (#226) stops the UI and the MCP stats tool from rendering the absence as
+  // a real zero. See src/lib/serverHealth.ts.
+  const body: ServerHealthResponse = {
+    status: 'ok',
+    network: config.stellarNetwork,
+    pricePerQuery: `${config.amountUsdc} USDC`,
     protocol: 'x402',
     facilitator: FACILITATOR_URL,
-    serperApiConfigured: !!SERPER_API_KEY,
-    groqApiConfigured: !!GROQ_API_KEY,
-    receivingAddressConfigured: !!RECEIVING_ADDRESS,
+    facilitatorCompatibility: {
+      compatible: currentValidation.valid,
+      network: currentValidation.network,
+      scheme: currentValidation.scheme,
+      asset: currentValidation.asset,
+      facilitator: currentValidation.facilitatorUrl,
+      errors: currentValidation.errors,
+      warnings: currentValidation.warnings,
+    },
+    serperApiConfigured: true,
+    groqApiConfigured: !!config.groqApiKey,
+    receivingAddressConfigured: true,
+    serperCircuitBreaker: getSerperBreakerState(),
     timestamp: new Date().toISOString(),
-  })
+    ...declareStatsUnsupported(SERVERLESS_STATS_UNAVAILABLE_REASON),
+  }
+
+  res.json(body)
 }

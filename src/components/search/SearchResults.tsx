@@ -1,15 +1,15 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { ExternalLink, Star, Clock, Sparkles, Download, FileJson, FileSpreadsheet, Check, Copy, Bookmark } from 'lucide-react'
-import type { SearchResult } from '../../hooks/useSearch'
-import { useSavedResearch } from '../../hooks/useSavedResearch'
-import { explorerTxUrl, truncateHash } from '../../lib/stellar'
+import { ExternalLink, Star, Clock, Sparkles, Search } from 'lucide-react'
+import type { PeopleAlsoAskResult, SearchResult } from '../../hooks/useSearch'
+import { formatRelevanceScore } from '../../lib/formatters'
+import { useDirection } from '../../lib/rtl'
 
 interface Props {
   results: SearchResult[]
   query: string
   isLoading?: boolean
-  txHash?: string | null
+  peopleAlsoAsk?: PeopleAlsoAskResult[]
 }
 
 const SERVER_URL = (import.meta as any).env?.VITE_SERVER_URL ?? (
@@ -18,82 +18,17 @@ const SERVER_URL = (import.meta as any).env?.VITE_SERVER_URL ?? (
     : 'http://localhost:3001'
 )
 
-export function SearchResults({ results, query, isLoading, txHash }: Props) {
+export function SearchResults({ results, query, isLoading, peopleAlsoAsk = [] }: Props) {
+  const { isRtl }                           = useDirection()
   const [summary, setSummary]               = useState<string>('')
   const [summaryError, setSummaryError]     = useState<string | null>(null)
   const [summarizing, setSummarizing]       = useState(false)
-  const [copiedUrl, setCopiedUrl]           = useState<string | null>(null)
-  const [showExportMenu, setShowExportMenu] = useState(false)
-  const { isSaved, toggle: toggleSaved }    = useSavedResearch()
 
-  const exportAsJSON = () => {
-    if (!results.length) return
-    const blob = new Blob([JSON.stringify(results, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `search-results-${Date.now()}.json`
-    a.click()
-    URL.revokeObjectURL(url)
-    setShowExportMenu(false)
-  }
-
-  const exportAsCSV = () => {
-    if (!results.length) return
-    const headers = ['Title', 'URL', 'Description', 'Source', 'Relevance Score']
-    const rows = results.map(r => [
-      `"${r.title.replace(/"/g, '""')}"`,
-      `"${r.url.replace(/"/g, '""')}"`,
-      `"${r.description.replace(/"/g, '""')}"`,
-      `"${r.source.replace(/"/g, '""')}"`,
-      r.relevanceScore
-    ])
-    const csvContent = [headers.join(','), ...rows.map(row => row.join(','))].join('\n')
-    const blob = new Blob([csvContent], { type: 'text/csv' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
-    a.download = `search-results-${Date.now()}.csv`
-    a.click()
-    URL.revokeObjectURL(url)
-    setShowExportMenu(false)
-  }
-
-  const copyToClipboard = async (url: string, e: React.MouseEvent) => {
-    // Prevent the anchor tag from navigating when clicking copy button
-    e.preventDefault()
-    e.stopPropagation()
-    
-    try {
-      await navigator.clipboard.writeText(url)
-      setCopiedUrl(url)
-      
-      // Reset copied state after 1.5 seconds
-      setTimeout(() => {
-        setCopiedUrl(prev => prev === url ? null : prev)
-      }, 1500)
-    } catch (err) {
-      console.error('Failed to copy:', err)
-      
-      // Fallback for older browsers
-      try {
-        const textArea = document.createElement('textarea')
-        textArea.value = url
-        textArea.style.position = 'fixed'
-        textArea.style.opacity = '0'
-        document.body.appendChild(textArea)
-        textArea.select()
-        document.execCommand('copy')
-        document.body.removeChild(textArea)
-        setCopiedUrl(url)
-        setTimeout(() => {
-          setCopiedUrl(prev => prev === url ? null : prev)
-        }, 1500)
-      } catch (fallbackErr) {
-        console.error('Fallback copy failed:', fallbackErr)
-      }
-    }
-  }
+  useEffect(() => {
+    setSummary('')
+    setSummaryError(null)
+    setSummarizing(false)
+  }, [query, results])
 
   if (isLoading) {
     return (
@@ -117,7 +52,7 @@ export function SearchResults({ results, query, isLoading, txHash }: Props) {
     )
   }
 
-  if (!results.length) return null
+  if (!results.length && !peopleAlsoAsk.length) return null
 
   const summarize = async () => {
     if (summarizing) return
@@ -198,78 +133,10 @@ export function SearchResults({ results, query, isLoading, txHash }: Props) {
   return (
     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-3">
       <div className="flex items-center justify-between gap-3 flex-wrap">
-        <div className="flex items-center gap-2.5 flex-wrap">
-          <p className="font-display text-xs text-white/35 tracking-widest" aria-live="polite">
-            {results.length} RESULTS · SERPER.DEV · PAID VIA x402
-          </p>
-          {txHash && (
-            <a
-              href={explorerTxUrl(txHash)}
-              target="_blank"
-              rel="noopener noreferrer"
-              aria-label="View transaction on Stellar Expert"
-              className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full font-mono text-xs text-neon-cyan hover:underline transition-all"
-              style={{
-                background: 'rgba(0,245,255,0.08)',
-                border: '1px solid rgba(0,245,255,0.25)',
-              }}
-            >
-              <span>Tx: {truncateHash(txHash)}</span>
-              <ExternalLink className="w-3 h-3 flex-shrink-0" />
-            </a>
-          )}
-        </div>
+        <p className="font-display text-xs text-white/35 tracking-widest" aria-live="polite">
+          {results.length} RESULTS · SERPER.DEV · PAID VIA x402
+        </p>
         <div className="flex items-center gap-3">
-          {/* Export Button with Format Selector */}
-          <div className="relative">
-            <button
-              onClick={() => setShowExportMenu(!showExportMenu)}
-              className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md font-display text-xs tracking-wider text-white/70 hover:text-neon-cyan hover:bg-neon-cyan/10 transition-colors"
-              style={{ border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.05)' }}
-              aria-label="Export search results"
-            >
-              <Download className="w-3 h-3" />
-              EXPORT
-            </button>
-
-            {/* Export Format Dropdown */}
-            <AnimatePresence>
-              {showExportMenu && (
-                <motion.div
-                  initial={{ opacity: 0, y: -5 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  exit={{ opacity: 0, y: -5 }}
-                  className="absolute top-full right-0 mt-1 w-48 rounded-lg overflow-hidden z-50"
-                  style={{
-                    background: 'rgba(6,13,20,0.98)',
-                    border: '1px solid rgba(0,245,255,0.2)',
-                  }}
-                >
-                  <button
-                    onClick={exportAsJSON}
-                    className="w-full px-3 py-2.5 text-left hover:bg-white/5 transition-colors flex items-center gap-2"
-                  >
-                    <FileJson className="w-4 h-4 text-neon-cyan" />
-                    <div>
-                      <div className="text-xs text-white">JSON Format</div>
-                      <div className="text-[10px] text-white/40">Structured data export</div>
-                    </div>
-                  </button>
-                  <button
-                    onClick={exportAsCSV}
-                    className="w-full px-3 py-2.5 text-left hover:bg-white/5 transition-colors flex items-center gap-2"
-                  >
-                    <FileSpreadsheet className="w-4 h-4 text-neon-green" />
-                    <div>
-                      <div className="text-xs text-white">CSV Format</div>
-                      <div className="text-[10px] text-white/40">Spreadsheet compatible</div>
-                    </div>
-                  </button>
-                </motion.div>
-              )}
-            </AnimatePresence>
-          </div>
-
           <button
             onClick={summarize}
             disabled={summarizing}
@@ -303,7 +170,7 @@ export function SearchResults({ results, query, isLoading, txHash }: Props) {
               <Sparkles className="w-3 h-3 text-neon-cyan" />
               <span className="font-display text-xs text-neon-cyan tracking-wider">AI SUMMARY · GROQ</span>
               {summarizing && (
-                <span className="flex items-center gap-1 ml-auto">
+                <span className="flex items-center gap-1 ms-auto">
                   {[0, 1, 2].map(j => (
                     <motion.div
                       key={j}
@@ -327,6 +194,27 @@ export function SearchResults({ results, query, isLoading, txHash }: Props) {
         )}
       </AnimatePresence>
 
+      {peopleAlsoAsk.length > 0 && (
+        <section aria-labelledby="people-also-ask-heading" className="rounded-xl p-4 space-y-2 border border-white/10 bg-white/[0.03]">
+          <h2 id="people-also-ask-heading" className="font-display text-sm text-white/70 tracking-wider">
+            PEOPLE ALSO ASK
+          </h2>
+          {peopleAlsoAsk.map((item) => (
+            <details key={`${item.question}-${item.url}`} className="group border-t border-white/10 pt-2">
+              <summary className="cursor-pointer text-sm text-white/70 hover:text-neon-cyan focus-visible:outline focus-visible:outline-2 focus-visible:outline-neon-cyan rounded">
+                {item.question}
+              </summary>
+              <div className="pt-2 pl-3 text-xs text-white/50 leading-relaxed">
+                <p>{item.answer}</p>
+                <a href={item.url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 mt-2 text-neon-cyan/70 hover:text-neon-cyan">
+                  {item.source} <ExternalLink className="w-3 h-3" aria-hidden="true" />
+                </a>
+              </div>
+            </details>
+          ))}
+        </section>
+      )}
+
       {results.map((r, i) => (
         <motion.a
           key={r.id}
@@ -338,7 +226,7 @@ export function SearchResults({ results, query, isLoading, txHash }: Props) {
           initial={{ opacity: 0, y: 16 }}
           animate={{ opacity: 1, y: 0 }}
           transition={{ delay: i * 0.06 }}
-          className="block group rounded-xl p-4 hover:border-neon-cyan/25 transition-all relative"
+          className="block group rounded-xl p-4 hover:border-neon-cyan/25 transition-all"
           style={{
             background: 'rgba(6,13,20,0.6)',
             border: '1px solid rgba(255,255,255,0.06)',
@@ -362,7 +250,7 @@ export function SearchResults({ results, query, isLoading, txHash }: Props) {
                 </span>
                 <div className="flex items-center gap-1 text-neon-amber/60">
                   <Star className="w-3 h-3 fill-current" />
-                  <span className="font-display text-xs">{(r.relevanceScore * 100).toFixed(0)}%</span>
+                  <span className="font-display text-xs">{formatRelevanceScore(r.relevanceScore)}</span>
                 </div>
                 {r.publishedAt && (
                   <div className="flex items-center gap-1 text-white/25">
@@ -372,71 +260,13 @@ export function SearchResults({ results, query, isLoading, txHash }: Props) {
                 )}
               </div>
 
-              <div className="flex items-start justify-between gap-2 mb-1">
-                <h3 className="text-white font-medium text-sm leading-snug group-hover:text-neon-cyan transition-colors">
-                  {r.title}
-                </h3>
-                {/* Save to research button — bookmarks this result with editable notes/tags (#305) */}
-                <button
-                  onClick={(e) => {
-                    e.preventDefault()
-                    e.stopPropagation()
-                    toggleSaved(r, query)
-                  }}
-                  className="relative flex-shrink-0 w-6 h-6 rounded-md flex items-center justify-center transition-all hover:bg-white/10"
-                  style={{
-                    border: isSaved(query, r.id) ? '1px solid rgba(255,184,0,0.4)' : '1px solid rgba(255,255,255,0.1)',
-                    color: isSaved(query, r.id) ? '#ffb800' : 'rgba(255,255,255,0.4)',
-                  }}
-                  aria-label={isSaved(query, r.id) ? 'Remove from saved research' : 'Save to research'}
-                  aria-pressed={isSaved(query, r.id)}
-                  title={isSaved(query, r.id) ? 'Saved — click to remove' : 'Save to research'}
-                >
-                  <Bookmark className="w-3 h-3" fill={isSaved(query, r.id) ? 'currentColor' : 'none'} />
-                </button>
-              </div>
+              <h3 className="text-white font-medium text-sm leading-snug mb-1 group-hover:text-neon-cyan transition-colors">
+                {r.title}
+              </h3>
 
-              <div className="flex items-center gap-2 mb-2">
-                <p className="font-mono text-xs truncate" style={{ color: 'rgba(0,245,255,0.35)' }}>
-                  {r.url}
-                </p>
-                {/* Copy button */}
-                <button
-                  onClick={(e) => copyToClipboard(r.url, e)}
-                  className="relative flex-shrink-0 w-6 h-6 rounded-md flex items-center justify-center opacity-0 group-hover:opacity-100 transition-all hover:bg-white/10"
-                  style={{
-                    border: copiedUrl === r.url ? '1px solid rgba(0,255,0,0.3)' : '1px solid rgba(255,255,255,0.1)',
-                    color: copiedUrl === r.url ? '#00ff00' : 'rgba(255,255,255,0.4)',
-                  }}
-                  aria-label="Copy URL to clipboard"
-                  title="Copy URL"
-                >
-                  {copiedUrl === r.url ? (
-                    <Check className="w-3 h-3" />
-                  ) : (
-                    <Copy className="w-3 h-3" />
-                  )}
-                  
-                  {/* Tooltip */}
-                  <AnimatePresence>
-                    {copiedUrl === r.url && (
-                      <motion.div
-                        initial={{ opacity: 0, y: 5, scale: 0.8 }}
-                        animate={{ opacity: 1, y: 0, scale: 1 }}
-                        exit={{ opacity: 0, y: 5, scale: 0.8 }}
-                        className="absolute -top-8 left-1/2 transform -translate-x-1/2 px-2 py-1 rounded-md text-[10px] font-medium whitespace-nowrap pointer-events-none"
-                        style={{
-                          background: 'rgba(0,0,0,0.9)',
-                          border: '1px solid rgba(0,255,0,0.3)',
-                          color: '#00ff00',
-                        }}
-                      >
-                        Copied!
-                      </motion.div>
-                    )}
-                  </AnimatePresence>
-                </button>
-              </div>
+              <p className="font-mono text-xs mb-2 truncate" style={{ color: 'rgba(0,245,255,0.35)' }}>
+                {r.url}
+              </p>
 
               <p className="text-white/45 text-xs leading-relaxed line-clamp-2">
                 {r.description}
@@ -448,13 +278,18 @@ export function SearchResults({ results, query, isLoading, txHash }: Props) {
             </div>
           </div>
 
+          {/* Relevance bar */}
           <div className="mt-3 h-px bg-white/5 rounded-full overflow-hidden">
             <motion.div
               initial={{ width: 0 }}
               animate={{ width: `${r.relevanceScore * 100}%` }}
               transition={{ delay: i * 0.06 + 0.3, duration: 0.5, ease: 'easeOut' }}
               className="h-full rounded-full"
-              style={{ background: 'linear-gradient(90deg, rgba(0,245,255,0.6), rgba(0,245,255,0.15))' }}
+              style={{
+                background: isRtl
+                  ? 'linear-gradient(270deg, rgba(0,245,255,0.6), rgba(0,245,255,0.15))'
+                  : 'linear-gradient(90deg, rgba(0,245,255,0.6), rgba(0,245,255,0.15))',
+              }}
             />
           </div>
         </motion.a>
