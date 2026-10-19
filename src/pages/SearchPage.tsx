@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import { useTranslation } from 'react-i18next'
 import { Search, Zap, AlertCircle } from 'lucide-react'
+import { toast } from 'sonner'
 import {
   SearchBar,
   SearchResults,
@@ -9,61 +10,123 @@ import {
   PaymentFlowVisualizer,
   StatsGrid,
   ZeroBalanceBanner,
-  SpellingCorrectionBanner,
-  ModeSelector,
-  ImageResults,
-  NewsResults,
 } from '../components'
 import type { SearchSession } from '../hooks/useSearch'
 import type { WalletState } from '../hooks/useFreighterWallet'
-import type { SearchMode } from '../types'
 import { AMOUNT_USDC } from '../lib/stellar'
+
+export interface PendingSearch {
+  query: string
+  freshness?: string
+}
 
 interface Props {
   wallet: WalletState
-  onConnectWallet: () => void
+  onConnectWallet: () => void | Promise<void> | Promise<boolean>
   session: SearchSession
-  search: (query: string, freshnessOrCount?: string | number, count?: number, mode?: SearchMode) => Promise<void>
+  search: (query: string, countOrFreshness?: number | string, includeDomains?: string[], excludeDomains?: string[]) => Promise<void> | void
   reset: () => void
 }
 
 export function SearchPage({ wallet, onConnectWallet, session, search, reset }: Props) {
   const { t } = useTranslation('search')
-  const [dismissedSuggestion, setDismissedSuggestion] = useState(false)
-  const [searchMode, setSearchMode] = useState<SearchMode>('web')
-  const [activeFreshness, setActiveFreshness] = useState<string | undefined>(undefined)
+  const [pendingSearch, setPendingSearch] = useState<PendingSearch | null>(null)
+  const pendingSearchRef = useRef<PendingSearch | null>(null)
 
-  // #150 — after an async search settles, move keyboard/screen-reader focus to
-  // the error alert (SearchResults moves focus to the results heading on
-  // success). Focus only moves on the transition into `error`; it is never
-  // stolen while typing, signing, or during manual navigation.
-  const errorRef       = useRef<HTMLDivElement>(null)
-  const prevStatusRef  = useRef(session.status)
-
+  // Auto-resume search when wallet connects successfully
   useEffect(() => {
-    const prevStatus = prevStatusRef.current
-    prevStatusRef.current = session.status
-    if (prevStatus !== 'error' && session.status === 'error' && errorRef.current) {
-      errorRef.current.focus()
+    if (wallet.connected && wallet.publicKey && pendingSearchRef.current) {
+      const { query, freshness } = pendingSearchRef.current
+      pendingSearchRef.current = null
+      setPendingSearch(null)
+      if (freshness) {
+        search(query, freshness)
+      } else {
+        search(query, 5, [], [])
+      }
     }
-  }, [session.status])
+  }, [wallet.connected, wallet.publicKey, search])
 
-  const handleSearch = (query: string, freshness?: string) => {
-    setDismissedSuggestion(false)
-    // Suggestions are alternate queries, not new filter selections. Keep the
-    // user's visible freshness filter when they choose one.
-    const nextFreshness = freshness ?? activeFreshness
-    if (freshness !== undefined) setActiveFreshness(freshness)
-    if (!wallet.connected) { onConnectWallet(); return }
-    search(query, nextFreshness, searchMode === 'web' ? 5 : 10, searchMode)
+  // Handle wallet error / cancellation while a search was pending
+  useEffect(() => {
+    if (wallet.error && pendingSearchRef.current) {
+      const errorMsg = wallet.error
+      pendingSearchRef.current = null
+      setPendingSearch(null)
+      toast.error('Wallet connection failed', {
+        description: errorMsg,
+      })
+    }
+  }, [wallet.error])
+
+  const handleSearch = async (
+    query: string,
+    freshnessOrInclude?: string | string[],
+    excludeDomains?: string[],
+    freshnessParam?: string
+  ) => {
+    let freshness: string | undefined
+    let incDomains: string[] = []
+    let excDomains: string[] = []
+
+    if (typeof freshnessOrInclude === 'string') {
+      freshness = freshnessOrInclude
+      if (Array.isArray(excludeDomains)) incDomains = excludeDomains
+    } else if (Array.isArray(freshnessOrInclude)) {
+      incDomains = freshnessOrInclude
+      if (Array.isArray(excludeDomains)) excDomains = excludeDomains
+      if (typeof freshnessParam === 'string' && freshnessParam) freshness = freshnessParam
+    }
+
+    if (!wallet.connected) {
+      const pending: PendingSearch = { query: query.trim(), freshness: freshness || undefined }
+      pendingSearchRef.current = pending
+      setPendingSearch(pending)
+      toast.info('Connect Freighter', {
+        description: 'Connect your wallet to resume your search automatically.',
+      })
+      try {
+        const connected = await onConnectWallet()
+        if (connected === false && pendingSearchRef.current) {
+          pendingSearchRef.current = null
+          setPendingSearch(null)
+          toast.error('Wallet connection cancelled', {
+            description: wallet.error || 'Connection request was cancelled. Your query was retained.',
+          })
+        }
+      } catch (err: any) {
+        if (pendingSearchRef.current) {
+          pendingSearchRef.current = null
+          setPendingSearch(null)
+          toast.error('Wallet connection failed', {
+            description: err?.message || 'Connection request failed. Your query was retained.',
+          })
+        }
+      }
+      return
+    }
+
+    pendingSearchRef.current = null
+    setPendingSearch(null)
+    if (freshness) {
+      search(query, freshness)
+    } else {
+      search(query, 5, incDomains, excDomains)
+    }
+  }
+
+  const handleCancelPending = () => {
+    pendingSearchRef.current = null
+    setPendingSearch(null)
   }
 
   const handleReset = () => {
-    setDismissedSuggestion(false)
+    pendingSearchRef.current = null
+    setPendingSearch(null)
     reset()
   }
 
-  const isSearching = session.status === 'searching'
+  const isSearching = session.status === 'searching' || (!!pendingSearch && wallet.loading)
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-8 space-y-8">
@@ -118,7 +181,7 @@ export function SearchPage({ wallet, onConnectWallet, session, search, reset }: 
                 style={{ border: '1px solid rgba(0,245,255,0.4)', background: 'rgba(0,245,255,0.08)', boxShadow: '0 0 20px rgba(0,245,255,0.15)' }}
               >
                 <Zap className="w-4 h-4" />
-                {t('connectCta')}
+                {t('connectCta', 'CONNECT FREIGHTER TO SEARCH')}
               </motion.button>
             )}
           </motion.div>
@@ -129,16 +192,51 @@ export function SearchPage({ wallet, onConnectWallet, session, search, reset }: 
         connected={wallet.connected}
         publicKey={wallet.publicKey}
         usdcBalance={wallet.usdcBalance}
-        accountExists={wallet.accountExists}
-        hasUsdcTrustline={wallet.hasUsdcTrustline}
-        accountStatus={wallet.accountStatus}
       />
 
-      <ModeSelector
-        mode={searchMode}
-        onChange={setSearchMode}
-        disabled={isSearching}
-      />
+      {pendingSearch && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="flex items-center justify-between p-4 rounded-xl border border-neon-cyan/30 bg-neon-cyan/5 text-neon-cyan"
+        >
+          <div className="flex items-center gap-3">
+            <Zap className="w-4 h-4 animate-pulse text-neon-cyan" />
+            <p className="text-sm font-display tracking-wide">
+              Connecting wallet to resume search for{' '}
+              <span className="text-white font-semibold">"{pendingSearch.query}"</span>
+              {pendingSearch.freshness && (
+                <span className="text-white/60 text-xs ml-1">
+                  ({pendingSearch.freshness})
+                </span>
+              )}
+              ...
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={handleCancelPending}
+            className="text-xs text-white/50 hover:text-white underline cursor-pointer ml-3 font-display tracking-wider"
+          >
+            CANCEL
+          </button>
+        </div>
+      )}
+
+      {wallet.error && !pendingSearch && (
+        <div
+          role="alert"
+          className="flex items-center gap-3 p-4 rounded-xl border border-red-500/25 bg-red-500/5 text-red-300"
+        >
+          <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0" />
+          <div className="flex-1">
+            <p className="text-sm font-medium">{wallet.error}</p>
+            <p className="text-xs text-red-400/70 mt-0.5">
+              Your query and filters have been preserved in the search bar.
+            </p>
+          </div>
+        </div>
+      )}
 
       <SearchBar
         onSearch={handleSearch}
@@ -146,8 +244,15 @@ export function SearchPage({ wallet, onConnectWallet, session, search, reset }: 
         walletConnected={wallet.connected}
         usdcBalance={wallet.usdcBalance}
         walletNetwork={wallet.network}
-        defaultQuery={session.query}
+        defaultQuery={session.query || pendingSearch?.query || ''}
+        defaultFreshness={pendingSearch?.freshness || ''}
       />
+
+      <AnimatePresence>
+        {session.status === 'idle' && (
+          <SearchResults results={[]} query="" />
+        )}
+      </AnimatePresence>
 
       <AnimatePresence>
         {session.status !== 'idle' && (
@@ -160,48 +265,19 @@ export function SearchPage({ wallet, onConnectWallet, session, search, reset }: 
             <PaymentFlowVisualizer session={session} />
 
             {session.status === 'error' && (
-              <div
-                ref={errorRef}
-                role="alert"
-                tabIndex={-1}
-                className="flex items-center gap-3 p-4 rounded-xl border border-red-500/25 bg-red-500/5 focus:outline-none"
-              >
+              <div className="flex items-center gap-3 p-4 rounded-xl border border-red-500/25 bg-red-500/5">
                 <AlertCircle className="w-4 h-4 text-red-400 flex-shrink-0" />
                 <p className="text-sm text-red-300">{session.error}</p>
               </div>
             )}
 
-            {session.status === 'complete' && searchMode === 'web' && (
-              <SpellingCorrectionBanner
-                originalQuery={session.originalQuery}
-                executedQuery={session.executedQuery || session.query}
-                suggestedQuery={session.suggestedQuery}
-                isCorrected={session.isCorrected}
-                onSearch={handleSearch}
-                onDismiss={() => setDismissedSuggestion(true)}
-                isDismissed={dismissedSuggestion}
-              />
-            )}
-
-            {searchMode === 'web' && (session.status === 'complete' || session.status === 'searching') && (
+            {(session.status === 'complete' || session.status === 'searching') && (
               <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.15 }}>
-                <SearchResults results={session.results as any} query={session.query} isLoading={session.status === 'searching'} txHash={session.txHash} />
+                <SearchResults results={session.results} query={session.query} isLoading={session.status === 'searching'} peopleAlsoAsk={session.peopleAlsoAsk} />
               </motion.div>
             )}
 
-            {searchMode === 'images' && (session.status === 'complete' || session.status === 'searching') && (
-              <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.15 }}>
-                <ImageResults results={session.results as any} isLoading={session.status === 'searching'} />
-              </motion.div>
-            )}
-
-            {searchMode === 'news' && (session.status === 'complete' || session.status === 'searching') && (
-              <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.15 }}>
-                <NewsResults results={session.results as any} isLoading={session.status === 'searching'} />
-              </motion.div>
-            )}
-
-            {session.status === 'complete' && session.suggestions && session.suggestions.length > 0 && searchMode === 'web' && (
+            {session.status === 'complete' && session.suggestions.length > 0 && (
               <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.3 }}>
                 <SearchSuggestions onSelect={handleSearch} aiSuggestions={session.suggestions} />
               </motion.div>
@@ -210,7 +286,7 @@ export function SearchPage({ wallet, onConnectWallet, session, search, reset }: 
             {(session.status === 'complete' || session.status === 'error') && (
               <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-center pt-2">
                 <button onClick={handleReset} className="font-display text-xs text-white/25 hover:text-neon-cyan transition-colors tracking-widest">
-                  {t('newSearch')}
+                  {t('newSearch', '← NEW SEARCH')}
                 </button>
               </motion.div>
             )}

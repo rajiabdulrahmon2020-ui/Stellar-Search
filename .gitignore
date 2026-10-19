@@ -1,5 +1,6 @@
 node_modules/
 dist/
+coverage/
 .env
 .env.production
 .env.*.local
@@ -7,6 +8,9 @@ dist/
 .DS_Store
 *.log
 .vite/
+artifacts/
+smoke-report.json
+smoke-report.md
 
 # Local scripts
 create_issues.py
