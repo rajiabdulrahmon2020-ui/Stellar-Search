@@ -1,0 +1,607 @@
+import type { SearchResult, ImageResult, NewsResult, Sitelink, PeopleAlsoAskResult } from '../types/index.js'
+
+/** Normalize Serper's optional People Also Ask expansion without trusting upstream URLs. */
+export function normalizePeopleAlsoAsk(rawData: unknown): PeopleAlsoAskResult[] {
+  if (!rawData || typeof rawData !== 'object') return []
+  const rows = (rawData as Record<string, unknown>).peopleAlsoAsk
+  if (!Array.isArray(rows)) return []
+
+  return rows.flatMap((item) => {
+    if (!item || typeof item !== 'object') return []
+    const row = item as Record<string, unknown>
+    const question = typeof row.question === 'string' ? row.question.trim() : ''
+    const answerValue = row.snippet ?? row.answer
+    const answer = typeof answerValue === 'string' ? answerValue.trim() : ''
+    const linkValue = row.link ?? row.url
+    if (!question || !answer || !isValidHttpUrl(linkValue)) return []
+    const url = (linkValue as string).trim()
+    const sourceValue = row.title ?? row.source
+    const source = typeof sourceValue === 'string' && sourceValue.trim()
+      ? sourceValue.trim()
+      : extractSafeHostname(url)
+    return [{ question, answer, source, url }]
+  })
+}
+
+/**
+ * Validates whether a given string is a valid HTTP or HTTPS URL.
+ */
+export function isValidHttpUrl(url: unknown): boolean {
+  if (typeof url !== 'string' || !url.trim()) return false
+  try {
+    const parsed = new URL(url.trim())
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Safely extracts a display hostname (domain) from a URL string.
+ */
+export function extractSafeHostname(url: string): string {
+  try {
+    const parsed = new URL(url)
+    return parsed.hostname.replace(/^www\./i, '')
+  } catch {
+    return url || 'unknown'
+  }
+}
+
+/**
+ * Canonical URL parameters that should be removed for deduplication.
+ * Includes common tracking parameters from various platforms.
+ */
+const TRACKING_PARAMS = new Set([
+  // Google Analytics
+  'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term',
+  // Facebook
+  'fbclid',
+  // Google Ads
+  'gclid',
+  // Microsoft
+  'msclkid',
+  // Other common tracking
+  'ref', 'referrer', 'source', 'campaign', 'medium', 'content',
+  'click_id', 'affiliate', 'partner_id', 'token', 'session_id',
+])
+
+/**
+ * Canonicalizes a URL for deduplication by:
+ * 1. Removing URL fragments (#...)
+ * 2. Removing configured tracking parameters (utm_*, fbclid, gclid, etc.)
+ * 3. Normalizing protocol and domain casing
+ * 4. Sorting remaining query parameters for consistency
+ *
+ * Returns the canonical URL string or the original if parsing fails.
+ */
+export function canonicalizeUrl(urlString: string): string {
+  try {
+    const url = new URL(urlString.trim())
+
+    // Remove fragment
+    url.hash = ''
+
+    // Remove tracking parameters
+    const params = new URLSearchParams(url.search)
+    for (const key of Array.from(params.keys())) {
+      if (TRACKING_PARAMS.has(key.toLowerCase())) {
+        params.delete(key)
+      }
+    }
+
+    // Reconstruct search with sorted params for consistency
+    const sortedParams = new URLSearchParams()
+    const keys = Array.from(params.keys()).sort()
+    for (const key of keys) {
+      sortedParams.append(key, params.get(key) || '')
+    }
+
+    url.search = sortedParams.toString()
+
+    return url.toString()
+  } catch {
+    return urlString.trim()
+  }
+}
+
+/**
+ * Validates unknown raw upstream JSON payload from Serper web search
+ * and normalizes organic results deterministically. Deduplicates by canonical URL.
+ * Skips malformed rows.
+ */
+export function normalizeOrganicResults(rawData: unknown): SearchResult[] {
+  if (!rawData || typeof rawData !== 'object') {
+    return []
+  }
+
+  const payload = rawData as Record<string, unknown>
+  if (!Array.isArray(payload.organic)) {
+    return []
+  }
+
+  const validResults: SearchResult[] = []
+  const seenCanonicalUrls = new Set<string>()
+
+  for (const item of payload.organic) {
+    if (!item || typeof item !== 'object') {
+      continue
+    }
+
+    const row = item as Record<string, unknown>
+
+    // Must have a valid HTTP/HTTPS link
+    if (!isValidHttpUrl(row.link)) {
+      continue
+    }
+
+    const url = (row.link as string).trim()
+    const canonicalUrl = canonicalizeUrl(url)
+
+    // Skip if we've already seen this canonical URL (deduplication)
+    if (seenCanonicalUrls.has(canonicalUrl)) {
+      continue
+    }
+    seenCanonicalUrls.add(canonicalUrl)
+
+    // Title: string or fallback
+    const title = typeof row.title === 'string' && row.title.trim()
+      ? row.title.trim()
+      : 'No title'
+
+    // Description: snippet or description or empty
+    let description = ''
+    if (typeof row.snippet === 'string' && row.snippet.trim()) {
+      description = row.snippet.trim()
+    } else if (typeof row.description === 'string' && row.description.trim()) {
+      description = row.description.trim()
+    }
+
+    // Source domain
+    const source = extractSafeHostname(url)
+
+    // Published date
+    const publishedAt = typeof row.date === 'string' && row.date.trim()
+      ? row.date.trim()
+      : undefined
+
+    // Sitelinks: validate up to 4 entries, each must have a valid URL
+    const MAX_SITELINKS = 4
+    const sitelinks: Sitelink[] = []
+    if (Array.isArray(row.sitelinks)) {
+      for (const sl of row.sitelinks) {
+        if (sitelinks.length >= MAX_SITELINKS) break
+        if (!sl || typeof sl !== 'object') continue
+        const slRow = sl as Record<string, unknown>
+        if (!isValidHttpUrl(slRow.link)) continue
+        const slTitle = typeof slRow.title === 'string' && slRow.title.trim()
+          ? slRow.title.trim()
+          : 'Link'
+        sitelinks.push({ title: slTitle, url: (slRow.link as string).trim() })
+      }
+    }
+
+    const index = validResults.length
+    validResults.push({
+      id: String(index + 1),
+      title,
+      url,
+      description,
+      source,
+      relevanceScore: Math.max(0.5, 1 - index * 0.06),
+      publishedAt,
+      ...(sitelinks.length > 0 && { sitelinks }),
+    })
+  }
+
+  return validResults
+}
+
+/**
+ * Validates unknown raw upstream JSON payload from Serper image search
+ * and normalizes image results deterministically. Deduplicates by source URL.
+ * Skips malformed rows.
+ */
+export function normalizeImageResults(rawData: unknown): ImageResult[] {
+  if (!rawData || typeof rawData !== 'object') {
+    return []
+  }
+
+  const payload = rawData as Record<string, unknown>
+  if (!Array.isArray(payload.images)) {
+    return []
+  }
+
+  const validResults: ImageResult[] = []
+  const seenSourceUrls = new Set<string>()
+
+  for (const item of payload.images) {
+    if (!item || typeof item !== 'object') {
+      continue
+    }
+
+    const row = item as Record<string, unknown>
+
+    // Must have a valid HTTP/HTTPS imageUrl
+    if (!isValidHttpUrl(row.imageUrl)) {
+      continue
+    }
+
+    const imageUrl = (row.imageUrl as string).trim()
+
+    // Title: string or fallback
+    const title = typeof row.title === 'string' && row.title.trim()
+      ? row.title.trim()
+      : 'No title'
+
+    // Source URL / link
+    const sourceUrl = isValidHttpUrl(row.link)
+      ? (row.link as string).trim()
+      : imageUrl
+
+    // Canonicalize source URL for deduplication
+    const canonicalSourceUrl = canonicalizeUrl(sourceUrl)
+    if (seenSourceUrls.has(canonicalSourceUrl)) {
+      continue
+    }
+    seenSourceUrls.add(canonicalSourceUrl)
+
+    // Thumbnail URL
+    const thumbnailUrl = isValidHttpUrl(row.thumbnailUrl)
+      ? (row.thumbnailUrl as string).trim()
+      : imageUrl
+
+    // Source domain
+    const source = extractSafeHostname(sourceUrl)
+
+    // Dimensions
+    const width = typeof row.imageWidth === 'number' && Number.isFinite(row.imageWidth) && row.imageWidth > 0
+      ? row.imageWidth
+      : undefined
+
+    const height = typeof row.imageHeight === 'number' && Number.isFinite(row.imageHeight) && row.imageHeight > 0
+      ? row.imageHeight
+      : undefined
+
+    const index = validResults.length
+    validResults.push({
+      id: String(index + 1),
+      title,
+      imageUrl,
+      thumbnailUrl,
+      sourceUrl,
+      source,
+      width,
+      height,
+    })
+  }
+
+  return validResults
+}
+
+/**
+ * Validates unknown raw upstream JSON payload from Serper news search
+ * and normalizes news results deterministically. Deduplicates by canonical URL.
+ * Skips malformed rows.
+ */
+export function normalizeNewsResults(rawData: unknown): NewsResult[] {
+  if (!rawData || typeof rawData !== 'object') {
+    return []
+  }
+
+  const payload = rawData as Record<string, unknown>
+  if (!Array.isArray(payload.news)) {
+    return []
+  }
+
+  const validResults: NewsResult[] = []
+  const seenCanonicalUrls = new Set<string>()
+
+  for (const item of payload.news) {
+    if (!item || typeof item !== 'object') {
+      continue
+    }
+
+    const row = item as Record<string, unknown>
+
+    // Must have a valid HTTP/HTTPS link
+    if (!isValidHttpUrl(row.link)) {
+      continue
+    }
+
+    const url = (row.link as string).trim()
+    const canonicalUrl = canonicalizeUrl(url)
+
+    // Skip if we've already seen this canonical URL (deduplication)
+    if (seenCanonicalUrls.has(canonicalUrl)) {
+      continue
+    }
+    seenCanonicalUrls.add(canonicalUrl)
+
+    // Title: string or fallback
+    const title = typeof row.title === 'string' && row.title.trim()
+      ? row.title.trim()
+      : 'No title'
+
+    // Snippet: string or empty
+    const snippet = typeof row.snippet === 'string' && row.snippet.trim()
+      ? row.snippet.trim()
+      : ''
+
+    // Source: explicit string or fallback to hostname
+    const source = typeof row.source === 'string' && row.source.trim()
+      ? row.source.trim()
+      : extractSafeHostname(url)
+
+    // Published date
+    const publishedAt = typeof row.date === 'string' && row.date.trim()
+      ? row.date.trim()
+      : undefined
+
+    // Image URL
+    const imageUrl = isValidHttpUrl(row.imageUrl)
+      ? (row.imageUrl as string).trim()
+      : undefined
+
+    const index = validResults.length
+    validResults.push({
+      id: String(index + 1),
+      title,
+      url,
+      snippet,
+      source,
+      publishedAt,
+      imageUrl,
+    })
+  }
+
+  return validResults
+}
+
+export interface QueryMetadata {
+  originalQuery: string
+  executedQuery: string
+  suggestedQuery?: string
+  isCorrected: boolean
+}
+
+/**
+ * Normalizes query metadata from Serper upstream search response deterministically.
+ * Distinguishes originalQuery, executedQuery, and suggestedQuery ("did you mean" / spelling corrections).
+ */
+export function normalizeQueryMetadata(
+  rawData: unknown,
+  fallbackOriginalQuery: string = ''
+): QueryMetadata {
+  const defaultOriginal = typeof fallbackOriginalQuery === 'string' ? fallbackOriginalQuery.trim() : ''
+
+  if (!rawData || typeof rawData !== 'object') {
+    return {
+      originalQuery: defaultOriginal,
+      executedQuery: defaultOriginal,
+      suggestedQuery: undefined,
+      isCorrected: false,
+    }
+  }
+
+  const payload = rawData as Record<string, unknown>
+
+  // 1. Resolve original query
+  let originalQuery = defaultOriginal
+  const searchInfo = payload.searchInformation as Record<string, unknown> | undefined
+  if (searchInfo && typeof searchInfo.originalQuery === 'string' && searchInfo.originalQuery.trim()) {
+    originalQuery = searchInfo.originalQuery.trim()
+  } else if (typeof payload.originalQuery === 'string' && payload.originalQuery.trim()) {
+    originalQuery = payload.originalQuery.trim()
+  }
+
+  // 2. Resolve suggested query from various Serper / Google structures
+  let rawSuggestion: string | undefined
+
+  const spelling = payload.spelling as Record<string, unknown> | undefined
+  const spell = payload.spell as Record<string, unknown> | string | undefined
+
+  if (spelling && typeof spelling.didYouMean === 'string' && spelling.didYouMean.trim()) {
+    rawSuggestion = spelling.didYouMean.trim()
+  } else if (spelling && typeof spelling.queryCorrection === 'string' && spelling.queryCorrection.trim()) {
+    rawSuggestion = spelling.queryCorrection.trim()
+  } else if (spelling && typeof spelling.correctedQuery === 'string' && spelling.correctedQuery.trim()) {
+    rawSuggestion = spelling.correctedQuery.trim()
+  } else if (typeof payload.didYouMean === 'string' && payload.didYouMean.trim()) {
+    rawSuggestion = payload.didYouMean.trim()
+  } else if (typeof payload.queryCorrection === 'string' && payload.queryCorrection.trim()) {
+    rawSuggestion = payload.queryCorrection.trim()
+  } else if (searchInfo && typeof searchInfo.queryCorrection === 'string' && searchInfo.queryCorrection.trim()) {
+    rawSuggestion = searchInfo.queryCorrection.trim()
+  } else if (typeof spell === 'string' && spell.trim()) {
+    rawSuggestion = spell.trim()
+  } else if (spell && typeof spell === 'object') {
+    const spellObj = spell as Record<string, unknown>
+    if (typeof spellObj.queryCorrection === 'string' && spellObj.queryCorrection.trim()) {
+      rawSuggestion = spellObj.queryCorrection.trim()
+    } else if (typeof spellObj.didYouMean === 'string' && spellObj.didYouMean.trim()) {
+      rawSuggestion = spellObj.didYouMean.trim()
+    } else if (typeof spellObj.corrected === 'string' && spellObj.corrected.trim()) {
+      rawSuggestion = spellObj.corrected.trim()
+    }
+  }
+
+  // 3. Resolve executed query
+  let executedQuery = originalQuery
+  const searchParams = payload.searchParameters as Record<string, unknown> | undefined
+  if (searchParams && typeof searchParams.q === 'string' && searchParams.q.trim()) {
+    executedQuery = searchParams.q.trim()
+  } else if (typeof payload.executedQuery === 'string' && payload.executedQuery.trim()) {
+    executedQuery = payload.executedQuery.trim()
+  }
+
+  // If searchParameters.q is missing/same as originalQuery, but rawSuggestion was auto-applied
+  // (e.g. searchInfo indicates auto-correction happened):
+  if (
+    executedQuery.toLowerCase() === originalQuery.toLowerCase() &&
+    searchInfo &&
+    searchInfo.autoCorrected === true &&
+    rawSuggestion
+  ) {
+    executedQuery = rawSuggestion
+  }
+
+  const isCorrected = executedQuery.toLowerCase() !== originalQuery.toLowerCase()
+
+  // Suggested query text: if a suggestion exists and differs from original query
+  let suggestedQuery: string | undefined = undefined
+  if (rawSuggestion && rawSuggestion.toLowerCase() !== originalQuery.toLowerCase()) {
+    suggestedQuery = rawSuggestion
+  } else if (isCorrected) {
+    suggestedQuery = executedQuery
+  }
+
+  return {
+    originalQuery,
+    executedQuery,
+    suggestedQuery,
+    isCorrected,
+  }
+}
+
+/**
+ * Normalizes answer box data from Serper upstream search response.
+ * Answer boxes contain direct factual answers to queries like "what is X".
+ */
+export function normalizeAnswerBox(rawData: unknown): import('../types/index.js').AnswerBox | undefined {
+  if (!rawData || typeof rawData !== 'object') {
+    return undefined
+  }
+
+  const payload = rawData as Record<string, unknown>
+  const answerBoxRaw = payload.answerBox as Record<string, unknown> | undefined
+
+  if (!answerBoxRaw) {
+    return undefined
+  }
+
+  // Extract title
+  const title = typeof answerBoxRaw.title === 'string' && answerBoxRaw.title.trim()
+    ? answerBoxRaw.title.trim()
+    : undefined
+
+  // Extract answer
+  const answer = typeof answerBoxRaw.answer === 'string' && answerBoxRaw.answer.trim()
+    ? answerBoxRaw.answer.trim()
+    : undefined
+
+  // Must have both title and answer
+  if (!title || !answer) {
+    return undefined
+  }
+
+  // Extract source
+  const sourceRaw = answerBoxRaw.source as Record<string, unknown> | undefined
+  if (!sourceRaw || !isValidHttpUrl(sourceRaw.link)) {
+    return undefined
+  }
+
+  const sourceLink = (sourceRaw.link as string).trim()
+  const sourceTitle = typeof sourceRaw.title === 'string' && sourceRaw.title.trim()
+    ? sourceRaw.title.trim()
+    : 'Source'
+  const sourceDisplayLink = typeof sourceRaw.displayLink === 'string' && sourceRaw.displayLink.trim()
+    ? sourceRaw.displayLink.trim()
+    : undefined
+
+  return {
+    title,
+    answer,
+    source: {
+      title: sourceTitle,
+      link: sourceLink,
+      displayLink: sourceDisplayLink,
+    },
+  }
+}
+
+/**
+ * Normalizes knowledge graph data from Serper upstream search response.
+ * Knowledge graphs contain structured data about entities (people, places, things).
+ */
+export function normalizeKnowledgeGraph(rawData: unknown): import('../types/index.js').KnowledgeGraph | undefined {
+  if (!rawData || typeof rawData !== 'object') {
+    return undefined
+  }
+
+  const payload = rawData as Record<string, unknown>
+  const knowledgeGraphRaw = payload.knowledgeGraph as Record<string, unknown> | undefined
+
+  if (!knowledgeGraphRaw) {
+    return undefined
+  }
+
+  // Extract title (required)
+  const title = typeof knowledgeGraphRaw.title === 'string' && knowledgeGraphRaw.title.trim()
+    ? knowledgeGraphRaw.title.trim()
+    : undefined
+
+  if (!title) {
+    return undefined
+  }
+
+  // Extract optional fields
+  const type = typeof knowledgeGraphRaw.type === 'string' && knowledgeGraphRaw.type.trim()
+    ? knowledgeGraphRaw.type.trim()
+    : undefined
+
+  const description = typeof knowledgeGraphRaw.description === 'string' && knowledgeGraphRaw.description.trim()
+    ? knowledgeGraphRaw.description.trim()
+    : undefined
+
+  const imageUrl = isValidHttpUrl(knowledgeGraphRaw.imageUrl)
+    ? (knowledgeGraphRaw.imageUrl as string).trim()
+    : undefined
+
+  const website = isValidHttpUrl(knowledgeGraphRaw.website)
+    ? (knowledgeGraphRaw.website as string).trim()
+    : undefined
+
+  // Extract attributes array
+  const attributes: import('../types/index.js').KnowledgeGraphAttribute[] = []
+  if (Array.isArray(knowledgeGraphRaw.attributes)) {
+    for (const attr of knowledgeGraphRaw.attributes) {
+      if (!attr || typeof attr !== 'object') continue
+      const attrRow = attr as Record<string, unknown>
+      const attrName = typeof attrRow.name === 'string' && attrRow.name.trim()
+        ? attrRow.name.trim()
+        : undefined
+      const attrValue = typeof attrRow.value === 'string' && attrRow.value.trim()
+        ? attrRow.value.trim()
+        : undefined
+      if (attrName && attrValue) {
+        attributes.push({ name: attrName, value: attrValue })
+      }
+    }
+  }
+
+  // Extract links array (related entities)
+  const links: import('../types/index.js').KnowledgeGraphLink[] = []
+  if (Array.isArray(knowledgeGraphRaw.links)) {
+    for (const link of knowledgeGraphRaw.links) {
+      if (!link || typeof link !== 'object') continue
+      const linkRow = link as Record<string, unknown>
+      if (!isValidHttpUrl(linkRow.link)) continue
+      const linkTitle = typeof linkRow.title === 'string' && linkRow.title.trim()
+        ? linkRow.title.trim()
+        : 'Link'
+      links.push({ title: linkTitle, link: (linkRow.link as string).trim() })
+    }
+  }
+
+  return {
+    title,
+    type,
+    description,
+    imageUrl,
+    website,
+    attributes: attributes.length > 0 ? attributes : undefined,
+    links: links.length > 0 ? links : undefined,
+  }
+}
+
