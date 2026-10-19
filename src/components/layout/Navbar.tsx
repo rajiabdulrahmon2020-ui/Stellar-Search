@@ -1,17 +1,12 @@
 import { motion } from 'framer-motion'
 import { useTranslation } from 'react-i18next'
-import { Search, BookOpen, BarChart2, ExternalLink, Zap, Github, Globe, HelpCircle } from 'lucide-react'
+import { Search, BookOpen, BarChart2, ExternalLink, Zap, Github, Globe } from 'lucide-react'
 import { WalletPanel } from '../wallet/WalletPanel'
 import type { WalletState, StellarTransaction } from '../../hooks/useFreighterWallet'
 import { IS_MAINNET } from '../../lib/stellar'
+import { useDirection } from '../../lib/rtl'
 
 type Page = 'search' | 'docs' | 'dashboard'
-
-const NAV_ITEMS: { id: Page; labelKey: string; Icon: React.FC<{ className?: string }> }[] = [
-  { id: 'search',    labelKey: 'nav.search',    Icon: Search    },
-  { id: 'docs',      labelKey: 'nav.docs',      Icon: BookOpen  },
-  { id: 'dashboard', labelKey: 'nav.dashboard', Icon: BarChart2 },
-]
 
 interface Props {
   page: Page
@@ -22,17 +17,21 @@ interface Props {
   onConnect: () => void
   onDisconnect: () => void
   onRefresh: () => void
-  onOpenOnboarding: () => void
 }
 
 export function Navbar({
   page, onNavigate,
   wallet, transactions, txLoading,
   onConnect, onDisconnect, onRefresh,
-  onOpenOnboarding,
 }: Props) {
   const { t } = useTranslation('common')
+  const { isRtl, toggleDirection } = useDirection()
 
+  const navItems: { id: Page; label: string; Icon: React.FC<{ className?: string }> }[] = [
+    { id: 'search',    label: t('nav.search', 'SEARCH'),       Icon: Search    },
+    { id: 'docs',      label: t('nav.docs', 'HOW IT WORKS'), Icon: BookOpen  },
+    { id: 'dashboard', label: t('nav.dashboard', 'DASHBOARD'),    Icon: BarChart2 },
+  ]
   return (
     <header
       className="sticky top-0 z-40 border-b border-white/5"
@@ -70,7 +69,7 @@ export function Navbar({
 
         {/* Nav links */}
         <nav className="flex items-center gap-1 flex-1" role="navigation" aria-label="Main navigation">
-          {NAV_ITEMS.map(({ id, labelKey, Icon }) => (
+          {navItems.map(({ id, label, Icon }) => (
             <button
               key={id}
               onClick={() => onNavigate(id)}
@@ -79,7 +78,7 @@ export function Navbar({
               style={{ color: page === id ? '#00f5ff' : 'rgba(255,255,255,0.3)' }}
             >
               <Icon className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">{t(labelKey)}</span>
+              <span className="hidden sm:inline">{label}</span>
               {page === id && (
                 <motion.div
                   layoutId="nav-active"
@@ -97,14 +96,17 @@ export function Navbar({
 
         {/* Right actions */}
         <div className="flex items-center gap-2 flex-shrink-0">
+          {/* RTL / Locale Switcher */}
           <button
-            onClick={onOpenOnboarding}
-            aria-label={t('nav.setupGuide')}
-            title={t('nav.setupGuide')}
-            className="p-2 rounded-lg text-white/25 hover:text-white/55 hover:bg-white/5 transition-all"
+            onClick={toggleDirection}
+            title={isRtl ? 'Switch to Left-to-Right (English)' : 'Switch to Right-to-Left (Arabic)'}
+            aria-label={isRtl ? 'Switch to English' : 'Switch to Arabic'}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-white/10 font-display text-[11px] text-white/50 hover:border-neon-cyan/40 hover:text-neon-cyan transition-all"
           >
-            <HelpCircle className="w-4 h-4" />
+            <Globe className="w-3.5 h-3.5" />
+            <span>{isRtl ? 'العربية (RTL)' : 'EN'}</span>
           </button>
+
           <a
             href="https://github.com/stellar/x402-stellar"
             target="_blank"

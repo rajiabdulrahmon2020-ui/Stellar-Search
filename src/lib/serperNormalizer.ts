@@ -1,4 +1,27 @@
-import type { SearchResult, ImageResult, NewsResult } from '../types/index.js'
+import type { SearchResult, ImageResult, NewsResult, Sitelink, PeopleAlsoAskResult } from '../types/index.js'
+
+/** Normalize Serper's optional People Also Ask expansion without trusting upstream URLs. */
+export function normalizePeopleAlsoAsk(rawData: unknown): PeopleAlsoAskResult[] {
+  if (!rawData || typeof rawData !== 'object') return []
+  const rows = (rawData as Record<string, unknown>).peopleAlsoAsk
+  if (!Array.isArray(rows)) return []
+
+  return rows.flatMap((item) => {
+    if (!item || typeof item !== 'object') return []
+    const row = item as Record<string, unknown>
+    const question = typeof row.question === 'string' ? row.question.trim() : ''
+    const answerValue = row.snippet ?? row.answer
+    const answer = typeof answerValue === 'string' ? answerValue.trim() : ''
+    const linkValue = row.link ?? row.url
+    if (!question || !answer || !isValidHttpUrl(linkValue)) return []
+    const url = (linkValue as string).trim()
+    const sourceValue = row.title ?? row.source
+    const source = typeof sourceValue === 'string' && sourceValue.trim()
+      ? sourceValue.trim()
+      : extractSafeHostname(url)
+    return [{ question, answer, source, url }]
+  })
+}
 
 /**
  * Validates whether a given string is a valid HTTP or HTTPS URL.
@@ -26,8 +49,66 @@ export function extractSafeHostname(url: string): string {
 }
 
 /**
+ * Canonical URL parameters that should be removed for deduplication.
+ * Includes common tracking parameters from various platforms.
+ */
+const TRACKING_PARAMS = new Set([
+  // Google Analytics
+  'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term',
+  // Facebook
+  'fbclid',
+  // Google Ads
+  'gclid',
+  // Microsoft
+  'msclkid',
+  // Other common tracking
+  'ref', 'referrer', 'source', 'campaign', 'medium', 'content',
+  'click_id', 'affiliate', 'partner_id', 'token', 'session_id',
+])
+
+/**
+ * Canonicalizes a URL for deduplication by:
+ * 1. Removing URL fragments (#...)
+ * 2. Removing configured tracking parameters (utm_*, fbclid, gclid, etc.)
+ * 3. Normalizing protocol and domain casing
+ * 4. Sorting remaining query parameters for consistency
+ *
+ * Returns the canonical URL string or the original if parsing fails.
+ */
+export function canonicalizeUrl(urlString: string): string {
+  try {
+    const url = new URL(urlString.trim())
+
+    // Remove fragment
+    url.hash = ''
+
+    // Remove tracking parameters
+    const params = new URLSearchParams(url.search)
+    for (const key of Array.from(params.keys())) {
+      if (TRACKING_PARAMS.has(key.toLowerCase())) {
+        params.delete(key)
+      }
+    }
+
+    // Reconstruct search with sorted params for consistency
+    const sortedParams = new URLSearchParams()
+    const keys = Array.from(params.keys()).sort()
+    for (const key of keys) {
+      sortedParams.append(key, params.get(key) || '')
+    }
+
+    url.search = sortedParams.toString()
+
+    return url.toString()
+  } catch {
+    return urlString.trim()
+  }
+}
+
+/**
  * Validates unknown raw upstream JSON payload from Serper web search
- * and normalizes organic results deterministically. Skips malformed rows.
+ * and normalizes organic results deterministically. Deduplicates by canonical URL.
+ * Skips malformed rows.
  */
 export function normalizeOrganicResults(rawData: unknown): SearchResult[] {
   if (!rawData || typeof rawData !== 'object') {
@@ -40,6 +121,7 @@ export function normalizeOrganicResults(rawData: unknown): SearchResult[] {
   }
 
   const validResults: SearchResult[] = []
+  const seenCanonicalUrls = new Set<string>()
 
   for (const item of payload.organic) {
     if (!item || typeof item !== 'object') {
@@ -54,6 +136,13 @@ export function normalizeOrganicResults(rawData: unknown): SearchResult[] {
     }
 
     const url = (row.link as string).trim()
+    const canonicalUrl = canonicalizeUrl(url)
+
+    // Skip if we've already seen this canonical URL (deduplication)
+    if (seenCanonicalUrls.has(canonicalUrl)) {
+      continue
+    }
+    seenCanonicalUrls.add(canonicalUrl)
 
     // Title: string or fallback
     const title = typeof row.title === 'string' && row.title.trim()
@@ -76,6 +165,22 @@ export function normalizeOrganicResults(rawData: unknown): SearchResult[] {
       ? row.date.trim()
       : undefined
 
+    // Sitelinks: validate up to 4 entries, each must have a valid URL
+    const MAX_SITELINKS = 4
+    const sitelinks: Sitelink[] = []
+    if (Array.isArray(row.sitelinks)) {
+      for (const sl of row.sitelinks) {
+        if (sitelinks.length >= MAX_SITELINKS) break
+        if (!sl || typeof sl !== 'object') continue
+        const slRow = sl as Record<string, unknown>
+        if (!isValidHttpUrl(slRow.link)) continue
+        const slTitle = typeof slRow.title === 'string' && slRow.title.trim()
+          ? slRow.title.trim()
+          : 'Link'
+        sitelinks.push({ title: slTitle, url: (slRow.link as string).trim() })
+      }
+    }
+
     const index = validResults.length
     validResults.push({
       id: String(index + 1),
@@ -85,6 +190,7 @@ export function normalizeOrganicResults(rawData: unknown): SearchResult[] {
       source,
       relevanceScore: Math.max(0.5, 1 - index * 0.06),
       publishedAt,
+      ...(sitelinks.length > 0 && { sitelinks }),
     })
   }
 
@@ -93,7 +199,8 @@ export function normalizeOrganicResults(rawData: unknown): SearchResult[] {
 
 /**
  * Validates unknown raw upstream JSON payload from Serper image search
- * and normalizes image results deterministically. Skips malformed rows.
+ * and normalizes image results deterministically. Deduplicates by source URL.
+ * Skips malformed rows.
  */
 export function normalizeImageResults(rawData: unknown): ImageResult[] {
   if (!rawData || typeof rawData !== 'object') {
@@ -106,6 +213,7 @@ export function normalizeImageResults(rawData: unknown): ImageResult[] {
   }
 
   const validResults: ImageResult[] = []
+  const seenSourceUrls = new Set<string>()
 
   for (const item of payload.images) {
     if (!item || typeof item !== 'object') {
@@ -130,6 +238,13 @@ export function normalizeImageResults(rawData: unknown): ImageResult[] {
     const sourceUrl = isValidHttpUrl(row.link)
       ? (row.link as string).trim()
       : imageUrl
+
+    // Canonicalize source URL for deduplication
+    const canonicalSourceUrl = canonicalizeUrl(sourceUrl)
+    if (seenSourceUrls.has(canonicalSourceUrl)) {
+      continue
+    }
+    seenSourceUrls.add(canonicalSourceUrl)
 
     // Thumbnail URL
     const thumbnailUrl = isValidHttpUrl(row.thumbnailUrl)
@@ -166,7 +281,8 @@ export function normalizeImageResults(rawData: unknown): ImageResult[] {
 
 /**
  * Validates unknown raw upstream JSON payload from Serper news search
- * and normalizes news results deterministically. Skips malformed rows.
+ * and normalizes news results deterministically. Deduplicates by canonical URL.
+ * Skips malformed rows.
  */
 export function normalizeNewsResults(rawData: unknown): NewsResult[] {
   if (!rawData || typeof rawData !== 'object') {
@@ -179,6 +295,7 @@ export function normalizeNewsResults(rawData: unknown): NewsResult[] {
   }
 
   const validResults: NewsResult[] = []
+  const seenCanonicalUrls = new Set<string>()
 
   for (const item of payload.news) {
     if (!item || typeof item !== 'object') {
@@ -193,6 +310,13 @@ export function normalizeNewsResults(rawData: unknown): NewsResult[] {
     }
 
     const url = (row.link as string).trim()
+    const canonicalUrl = canonicalizeUrl(url)
+
+    // Skip if we've already seen this canonical URL (deduplication)
+    if (seenCanonicalUrls.has(canonicalUrl)) {
+      continue
+    }
+    seenCanonicalUrls.add(canonicalUrl)
 
     // Title: string or fallback
     const title = typeof row.title === 'string' && row.title.trim()
@@ -337,6 +461,147 @@ export function normalizeQueryMetadata(
     executedQuery,
     suggestedQuery,
     isCorrected,
+  }
+}
+
+/**
+ * Normalizes answer box data from Serper upstream search response.
+ * Answer boxes contain direct factual answers to queries like "what is X".
+ */
+export function normalizeAnswerBox(rawData: unknown): import('../types/index.js').AnswerBox | undefined {
+  if (!rawData || typeof rawData !== 'object') {
+    return undefined
+  }
+
+  const payload = rawData as Record<string, unknown>
+  const answerBoxRaw = payload.answerBox as Record<string, unknown> | undefined
+
+  if (!answerBoxRaw) {
+    return undefined
+  }
+
+  // Extract title
+  const title = typeof answerBoxRaw.title === 'string' && answerBoxRaw.title.trim()
+    ? answerBoxRaw.title.trim()
+    : undefined
+
+  // Extract answer
+  const answer = typeof answerBoxRaw.answer === 'string' && answerBoxRaw.answer.trim()
+    ? answerBoxRaw.answer.trim()
+    : undefined
+
+  // Must have both title and answer
+  if (!title || !answer) {
+    return undefined
+  }
+
+  // Extract source
+  const sourceRaw = answerBoxRaw.source as Record<string, unknown> | undefined
+  if (!sourceRaw || !isValidHttpUrl(sourceRaw.link)) {
+    return undefined
+  }
+
+  const sourceLink = (sourceRaw.link as string).trim()
+  const sourceTitle = typeof sourceRaw.title === 'string' && sourceRaw.title.trim()
+    ? sourceRaw.title.trim()
+    : 'Source'
+  const sourceDisplayLink = typeof sourceRaw.displayLink === 'string' && sourceRaw.displayLink.trim()
+    ? sourceRaw.displayLink.trim()
+    : undefined
+
+  return {
+    title,
+    answer,
+    source: {
+      title: sourceTitle,
+      link: sourceLink,
+      displayLink: sourceDisplayLink,
+    },
+  }
+}
+
+/**
+ * Normalizes knowledge graph data from Serper upstream search response.
+ * Knowledge graphs contain structured data about entities (people, places, things).
+ */
+export function normalizeKnowledgeGraph(rawData: unknown): import('../types/index.js').KnowledgeGraph | undefined {
+  if (!rawData || typeof rawData !== 'object') {
+    return undefined
+  }
+
+  const payload = rawData as Record<string, unknown>
+  const knowledgeGraphRaw = payload.knowledgeGraph as Record<string, unknown> | undefined
+
+  if (!knowledgeGraphRaw) {
+    return undefined
+  }
+
+  // Extract title (required)
+  const title = typeof knowledgeGraphRaw.title === 'string' && knowledgeGraphRaw.title.trim()
+    ? knowledgeGraphRaw.title.trim()
+    : undefined
+
+  if (!title) {
+    return undefined
+  }
+
+  // Extract optional fields
+  const type = typeof knowledgeGraphRaw.type === 'string' && knowledgeGraphRaw.type.trim()
+    ? knowledgeGraphRaw.type.trim()
+    : undefined
+
+  const description = typeof knowledgeGraphRaw.description === 'string' && knowledgeGraphRaw.description.trim()
+    ? knowledgeGraphRaw.description.trim()
+    : undefined
+
+  const imageUrl = isValidHttpUrl(knowledgeGraphRaw.imageUrl)
+    ? (knowledgeGraphRaw.imageUrl as string).trim()
+    : undefined
+
+  const website = isValidHttpUrl(knowledgeGraphRaw.website)
+    ? (knowledgeGraphRaw.website as string).trim()
+    : undefined
+
+  // Extract attributes array
+  const attributes: import('../types/index.js').KnowledgeGraphAttribute[] = []
+  if (Array.isArray(knowledgeGraphRaw.attributes)) {
+    for (const attr of knowledgeGraphRaw.attributes) {
+      if (!attr || typeof attr !== 'object') continue
+      const attrRow = attr as Record<string, unknown>
+      const attrName = typeof attrRow.name === 'string' && attrRow.name.trim()
+        ? attrRow.name.trim()
+        : undefined
+      const attrValue = typeof attrRow.value === 'string' && attrRow.value.trim()
+        ? attrRow.value.trim()
+        : undefined
+      if (attrName && attrValue) {
+        attributes.push({ name: attrName, value: attrValue })
+      }
+    }
+  }
+
+  // Extract links array (related entities)
+  const links: import('../types/index.js').KnowledgeGraphLink[] = []
+  if (Array.isArray(knowledgeGraphRaw.links)) {
+    for (const link of knowledgeGraphRaw.links) {
+      if (!link || typeof link !== 'object') continue
+      const linkRow = link as Record<string, unknown>
+      if (!isValidHttpUrl(linkRow.link)) continue
+      const linkTitle = typeof linkRow.title === 'string' && linkRow.title.trim()
+        ? linkRow.title.trim()
+        : 'Link'
+      links.push({ title: linkTitle, link: (linkRow.link as string).trim() })
+    }
+  }
+
+  return {
+    title,
+    type,
+    description,
+    imageUrl,
+    website,
+    attributes: attributes.length > 0 ? attributes : undefined,
+    links: links.length > 0 ? links : undefined,
   }
 }
 

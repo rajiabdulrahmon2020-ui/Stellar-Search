@@ -18,6 +18,14 @@ vi.mock('groq-sdk', () => ({
 }))
 vi.mock('./logger', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  privacySafeIp: vi.fn((ip: string) => ip ? `ip:${ip}` : 'ip:unknown'),
+  privacySafeQuery: vi.fn(() => undefined),
+}))
+vi.mock('./readiness.js', () => ({
+  getReadiness: vi.fn().mockResolvedValue({ status: 'ok', checks: [] })
+}))
+vi.mock('./readiness.js', () => ({
+  getReadiness: vi.fn().mockResolvedValue({ status: 'ok', checks: [] })
 }))
 
 // Need to set env before import
@@ -48,6 +56,15 @@ describe('GET /health and GET /', () => {
     expect(typeof res.body.serperApiConfigured).toBe('boolean')
     expect(typeof res.body.groqApiConfigured).toBe('boolean')
     expect(typeof res.body.receivingAddressConfigured).toBe('boolean')
+    // Serper circuit breaker state (issue #120)
+    expect(res.body.serperCircuitBreaker).toMatchObject({
+      name: 'serper',
+      state: expect.stringMatching(/^(closed|open|half-open)$/),
+      failureCount: expect.any(Number),
+      failureThreshold: expect.any(Number),
+      openDurationMs: expect.any(Number),
+      halfOpenMaxProbes: expect.any(Number),
+    })
   })
 
   it('GET / returns service metadata with paid routes', async () => {
@@ -91,6 +108,15 @@ describe('POST /ai/chat validation', () => {
   it('returns 400 when messages empty', async () => {
     const res = await request(app).post('/ai/chat').send({ messages: [] }).set('Content-Type', 'application/json')
     expect(res.status).toBe(400)
+  })
+
+  it('returns 413 before handling a JSON body larger than 64 KiB', async () => {
+    const res = await request(app)
+      .post('/ai/chat')
+      .send({ messages: [{ role: 'user', content: 'x'.repeat(70_000) }] })
+      .set('Content-Type', 'application/json')
+
+    expect(res.status).toBe(413)
   })
 })
 

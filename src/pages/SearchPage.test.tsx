@@ -82,7 +82,7 @@ describe('SearchPage component', () => {
 
     const searchOriginalBtn = screen.getByTestId('search-original-btn')
     fireEvent.click(searchOriginalBtn)
-    expect(handleSearch).toHaveBeenCalledWith('stelarr blockchan', undefined)
+    expect(handleSearch).toHaveBeenCalledWith('stelarr blockchan', undefined, 5, 'web')
   })
 
   it('renders "Did you mean?" suggestion banner and allows accepting or dismissing', () => {
@@ -140,6 +140,21 @@ describe('SearchPage component', () => {
 
     const searchInput = screen.getByRole('textbox', { name: /search query/i })
     expect(searchInput).toBeInTheDocument()
+  })
+
+  it('preserves the active freshness filter for AI suggestions', async () => {
+    const search = vi.fn()
+    const session: SearchSession = {
+      query: 'stellar', results: [{ id: '1', title: 'Result', url: 'https://example.com', description: 'Description', source: 'example.com', relevanceScore: 1 }],
+      txHash: 'tx', paidAmount: '0.001', status: 'complete', suggestions: ['soroban payments'],
+    }
+    render(<SearchPage wallet={mockWalletConnected} onConnectWallet={vi.fn()} session={session} search={search} reset={vi.fn()} />)
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'pw' } })
+    fireEvent.change(screen.getByRole('textbox', { name: /search query/i }), { target: { value: 'stellar' } })
+    fireEvent.submit(screen.getByRole('search'))
+    fireEvent.click(await screen.findByRole('button', { name: 'soroban payments' }))
+    expect(search).toHaveBeenCalledWith('stellar', 'pw', 5, 'web')
+    expect(search).toHaveBeenCalledWith('soroban payments', 'pw', 5, 'web')
   })
 })
 
