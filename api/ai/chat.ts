@@ -1,23 +1,39 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import Groq from 'groq-sdk'
-import {
-  executeChatCompletion,
-  streamChatCompletion,
-  resolveModel,
-  validateChatMessages,
-  formatAiError,
-} from '../../src/lib/aiChatService'
+import { applyServerlessHeaders } from '../../src/lib/serverlessHeaders'
+import { AI_CHAT_LIMITS, validateChatMessages } from '../../src/lib/aiChatService'
 
-const groq = new Groq({ apiKey: process.env.GROQ_API_KEY || '' })
+export const AVAILABLE_MODELS = [
+  'llama-3.3-70b-versatile',
+  'llama-3.1-8b-instant',
+  'mixtral-8x7b-32768',
+] as const
+
+export type AvailableModel = (typeof AVAILABLE_MODELS)[number]
+
+const groq = new Groq({ apiKey: process.env.GROQ_API_KEY || 'dummy_key' })
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  if (typeof (res as any).setHeader === 'function') {
+    applyServerlessHeaders(res, req)
+  }
+
   if (req.method !== 'POST') {
+    if (typeof (res as any).setHeader === 'function') {
+      res.setHeader('Allow', 'POST, OPTIONS')
+    }
     return res.status(405).json({ error: 'Method not allowed' })
   }
 
+  const bodyBytes = Buffer.byteLength(JSON.stringify(req.body ?? {}), 'utf8')
+  if (bodyBytes > AI_CHAT_LIMITS.bodyBytes) {
+    return res.status(413).json({ error: `Request body exceeds ${AI_CHAT_LIMITS.bodyBytes} bytes` })
+  }
+
   const { messages, model: requestedModel } = (req.body || {}) as {
-    messages?: any[]
+    messages?: { role: 'system' | 'user' | 'assistant'; content: string }[]
     model?: string
+    stream?: boolean
   }
 
   const validationError = validateChatMessages(messages)
@@ -25,22 +41,39 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(400).json({ error: validationError })
   }
 
-  const model = resolveModel(requestedModel)
+  const model: AvailableModel =
+    requestedModel && (AVAILABLE_MODELS as readonly string[]).includes(requestedModel)
+      ? (requestedModel as AvailableModel)
+      : 'llama-3.3-70b-versatile'
+
   const wantsStream =
-    (req.headers.accept || '').includes('text/event-stream') ||
-    req.query.stream === '1'
+    (req.headers?.accept || '').includes('text/event-stream') ||
+    (req.body as any)?.stream === true ||
+    req.query?.stream === '1'
+
+  const groqMessages = [
+    {
+      role: 'system' as const,
+      content:
+        'You are StellarSearch AI, a concise research assistant. Help users craft better search queries and understand results. Keep responses under 200 words.',
+    },
+    ...messages,
+  ]
 
   if (!wantsStream) {
     try {
-      const result = await executeChatCompletion(groq, {
-        messages: messages!,
+      const completion = await groq.chat.completions.create({
         model,
+        messages: groqMessages,
+        max_tokens: 512,
+        temperature: 0.7,
       })
-      return res.json(result)
+
+      const content = completion.choices[0]?.message?.content || 'No response.'
+      return res.json({ content, model: completion.model || model })
     } catch (err: any) {
-      console.error('[groq error]', err?.message)
-      const formatted = formatAiError(err)
-      return res.status(500).json({ error: formatted.message })
+      console.error('[groq error]', err?.message || err)
+      return res.status(500).json({ error: `Groq AI error: ${err?.message || err}` })
     }
   }
 
@@ -59,29 +92,34 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   const controller = new AbortController()
-  req.on('close', () => controller.abort())
+  if (typeof req.on === 'function') {
+    req.on('close', () => controller.abort())
+  }
 
   try {
-    const stream = await streamChatCompletion(
-      groq,
+    const stream = await groq.chat.completions.create(
       {
-        messages: messages!,
         model,
+        messages: groqMessages,
+        max_tokens: 512,
+        temperature: 0.7,
+        stream: true,
       },
-      controller.signal
+      { signal: controller.signal }
     )
 
     for await (const chunk of stream) {
-      const delta = chunk.choices?.[0]?.delta?.content
+      const delta = chunk.choices[0]?.delta?.content
       if (delta) sendEvent('delta', { content: delta })
     }
     sendEvent('done', { model })
     res.end()
   } catch (err: any) {
-    if (controller.signal.aborted) return res.end()
-    console.error('[groq stream error]', err?.message)
-    const formatted = formatAiError(err)
-    sendEvent('error', { error: formatted.message })
+    if (controller.signal.aborted) {
+      return res.end()
+    }
+    console.error('[groq stream error]', err?.message || err)
+    sendEvent('error', { error: `Groq AI error: ${err?.message || err}` })
     res.end()
   }
 }

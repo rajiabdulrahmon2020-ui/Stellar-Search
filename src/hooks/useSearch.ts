@@ -10,42 +10,13 @@
  * Fix: convert Buffer → base64 string using Buffer.from(result).toString('base64')
  */
 
-import { useState, useCallback }              from 'react'
+import { useState, useCallback, useEffect, useRef } from 'react'
 import { toast }                               from 'sonner'
-import { Buffer }                              from 'buffer'
+import { x402Client, x402HTTPClient }          from '@x402/fetch'
+import { ExactStellarScheme }                  from '@x402/stellar/exact/client'
+import { signAuthEntry, getNetworkDetails }    from '@stellar/freighter-api'
+import { Networks }                            from '@stellar/stellar-sdk'
 import { IS_MAINNET, EXPECTED_WALLET_NETWORK, explorerTxUrl } from '../lib/stellar'
-
-// The x402/Freighter/Stellar payment stack is loaded on demand, on the first
-// call to `search()`, rather than imported statically — every page load
-// previously pulled all of it into the main bundle even for a user who never
-// runs a paid search (#336). Memoized so a second search in the same session
-// doesn't re-import.
-let paymentDepsPromise: Promise<{
-  x402Client: typeof import('@x402/fetch').x402Client
-  x402HTTPClient: typeof import('@x402/fetch').x402HTTPClient
-  ExactStellarScheme: typeof import('@x402/stellar/exact/client').ExactStellarScheme
-  signAuthEntry: typeof import('@stellar/freighter-api').signAuthEntry
-  getNetworkDetails: typeof import('@stellar/freighter-api').getNetworkDetails
-  Networks: typeof import('@stellar/stellar-sdk').Networks
-}> | null = null
-function loadPaymentDeps() {
-  if (!paymentDepsPromise) {
-    paymentDepsPromise = Promise.all([
-      import('@x402/fetch'),
-      import('@x402/stellar/exact/client'),
-      import('@stellar/freighter-api'),
-      import('@stellar/stellar-sdk'),
-    ]).then(([fetchMod, schemeMod, freighterMod, stellarMod]) => ({
-      x402Client: fetchMod.x402Client,
-      x402HTTPClient: fetchMod.x402HTTPClient,
-      ExactStellarScheme: schemeMod.ExactStellarScheme,
-      signAuthEntry: freighterMod.signAuthEntry,
-      getNetworkDetails: freighterMod.getNetworkDetails,
-      Networks: stellarMod.Networks,
-    }))
-  }
-  return paymentDepsPromise
-}
 
 const SERVER_URL = (import.meta as any).env?.VITE_SERVER_URL ?? (
   typeof window !== 'undefined' && window.location.origin.includes('vercel.app') 
@@ -58,82 +29,141 @@ const SOROBAN_RPC_TESTNET = 'https://soroban-testnet.stellar.org'
 const SOROBAN_RPC_MAINNET = 'https://soroban-rpc.mainnet.stellar.org' // Or another public RPC
 const SOROBAN_RPC_URL = IS_MAINNET ? SOROBAN_RPC_MAINNET : SOROBAN_RPC_TESTNET
 
-import type { SearchResult, SearchReceipt, SearchResponse, PaymentStep, SearchSession } from '../types'
+export interface SearchReceipt {
+  txHash: string
+  query: string
+  amount: string
+  timestamp: string
+  network: string
+}
 
-export type { SearchResult, SearchReceipt, PaymentStep, SearchSession }
+export interface SearchResult {
+  id: string
+  title: string
+  url: string
+  description: string
+  source: string
+  relevanceScore: number
+  publishedAt?: string
+}
 
-/**
- * Custom React hook for executing x402-metered search queries via Stellar/Freighter payment authorization.
- *
- * @param walletAddress - The Stellar public key address of the connected wallet, or `null` if unauthenticated.
- * @returns Object containing search session state (`session`), search execution function (`search`), and session reset function (`reset`).
- */
-export function useSearch(walletAddress: string | null = null) {
+export interface PeopleAlsoAskResult {
+  question: string
+  answer: string
+  source: string
+  url: string
+}
+
+// x402 flow steps, per the official x402 quickstart:
+//   1 Request   2 402 Received   3 Sign Auth   4 Retry   5 Facilitate   6 Result
+export type PaymentStep = 1 | 2 | 3 | 4 | 5 | 6
+
+export interface SearchSession {
+  query: string
+  originalQuery?: string
+  executedQuery?: string
+  suggestedQuery?: string
+  isCorrected?: boolean
+  results: SearchResult[]
+  txHash: string | null
+  paidAmount: string | null
+  status: 'idle' | 'searching' | 'complete' | 'error'
+  step?: PaymentStep
+  error?: string | null
+  durationMs?: number
+  suggestions: string[]
+  peopleAlsoAsk?: PeopleAlsoAskResult[]
+}
+
+interface ActivePayment {
+  controller: AbortController
+  cancelled: boolean
+}
+
+const NETWORK_CHANGED_MESSAGE = 'Freighter network changed. Payment creation was cancelled; switch back and try again.'
+
+export function useSearch(
+  walletAddress: string | null = null,
+  walletNetwork?: string,
+) {
   const [session, setSession] = useState<SearchSession>({
-    query: '', results: [], txHash: null, paidAmount: null, status: 'idle', suggestions: [],
+    query: '', results: [], txHash: null, paidAmount: null, status: 'idle', suggestions: [], peopleAlsoAsk: [],
   })
+  const activePaymentRef = useRef<ActivePayment | null>(null)
+  const previousNetworkRef = useRef(walletNetwork)
 
-  const search = useCallback(
-    async (
-      query: string,
-      freshnessOrCount?: string | number,
-      countOverride = 5
-    ) => {
-      if (!query.trim()) return
+  const cancelActivePayment = useCallback((message = NETWORK_CHANGED_MESSAGE) => {
+    const activePayment = activePaymentRef.current
+    if (!activePayment) return
 
-      let freshness = ''
-      let count = countOverride
+    activePayment.cancelled = true
+    activePayment.controller.abort()
+    setSession(prev => prev.status === 'searching'
+      ? { ...prev, status: 'error', error: message }
+      : prev)
+  }, [])
 
-      if (typeof freshnessOrCount === 'string') {
-        freshness = freshnessOrCount
-      } else if (typeof freshnessOrCount === 'number') {
-        count = freshnessOrCount
+  // A Freighter network switch invalidates any in-progress payment payload.
+  // `createPaymentPayload` itself cannot be aborted by the wallet API, so we
+  // invalidate its result and abort network requests before it can be sent.
+  useEffect(() => {
+    const previousNetwork = previousNetworkRef.current
+    previousNetworkRef.current = walletNetwork
+
+    if (previousNetwork && walletNetwork && previousNetwork !== walletNetwork) {
+      cancelActivePayment()
+    }
+  }, [walletNetwork, cancelActivePayment])
+
+  const cancel = useCallback(() => {
+    cancelActivePayment('Search request was cancelled.')
+  }, [cancelActivePayment])
+
+  const search = useCallback(async (query: string, countOrFreshness: number | string = 5, includeDomains?: string[], excludeDomains?: string[]) => {
+    if (!query.trim()) return
+
+    const activePayment: ActivePayment = {
+      controller: new AbortController(),
+      cancelled: false,
+    }
+    activePaymentRef.current = activePayment
+    const throwIfCancelled = () => {
+      if (activePayment.cancelled || activePayment.controller.signal.aborted) {
+        throw new Error(NETWORK_CHANGED_MESSAGE)
       }
+    }
 
-      setSession({
-        query,
-        originalQuery: query,
-        executedQuery: query,
-        suggestedQuery: undefined,
-        isCorrected: false,
-        results: [],
-        txHash: null,
-        paidAmount: null,
-        status: 'searching',
-        step: 1,
-        suggestions: [],
-      })
+    setSession({ query, results: [], txHash: null, paidAmount: null, status: 'searching', step: 1, suggestions: [], peopleAlsoAsk: [] })
 
-      const t0 = Date.now()
-      const params = new URLSearchParams({
-        q: query,
-        count: String(count),
-        suggestions: '1',
-      })
-      if (freshness) {
-        params.set('freshness', freshness)
-      }
+    const t0     = Date.now()
+    const countVal = typeof countOrFreshness === 'number' ? String(countOrFreshness) : '5'
+    const freshnessVal = typeof countOrFreshness === 'string' && countOrFreshness ? countOrFreshness : undefined
+    const params = new URLSearchParams({ q: query, count: countVal, suggestions: '1' })
+    if (freshnessVal) params.append('freshness', freshnessVal)
+    if (includeDomains && includeDomains.length > 0) params.append('includeDomains', includeDomains.join(','))
+    if (excludeDomains && excludeDomains.length > 0) params.append('excludeDomains', excludeDomains.join(','))
 
     const advance = (step: PaymentStep) =>
-      setSession((prev: SearchSession) => ({ ...prev, step }))
+      setSession(prev => ({ ...prev, step }))
 
     try {
       if (!walletAddress) throw new Error('Connect your Freighter wallet first.')
+      if (walletNetwork && walletNetwork !== EXPECTED_WALLET_NETWORK) {
+        throw new Error(`Switch Freighter to ${EXPECTED_WALLET_NETWORK}. Currently: ${walletNetwork}`)
+      }
 
       console.log('🔍 Starting search with wallet:', walletAddress)
 
-      const {
-        x402Client, x402HTTPClient, ExactStellarScheme,
-        signAuthEntry, getNetworkDetails, Networks,
-      } = await loadPaymentDeps()
-
       // Step 1 — verify Freighter is on correct network
-      const net = await getNetworkDetails()
-      if (net.error)              throw new Error(net.error.message)
-      if (net.network !== EXPECTED_WALLET_NETWORK) {
-        throw new Error(`Switch Freighter to ${EXPECTED_WALLET_NETWORK}. Currently: ${net.network}`)
+      if (!(typeof window !== 'undefined' && window.__STELLAR_SEARCH_E2E_WALLET__)) {
+        const net = await getNetworkDetails()
+        throwIfCancelled()
+        if (net.error)              throw new Error(net.error.message)
+        if (net.network !== EXPECTED_WALLET_NETWORK) {
+          throw new Error(`Switch Freighter to ${EXPECTED_WALLET_NETWORK}. Currently: ${net.network}`)
+        }
+        console.log('✅ Network verified:', net.network)
       }
-      console.log('✅ Network verified:', net.network)
 
       // Step 2 — build the signer
       const passphrase = IS_MAINNET ? Networks.PUBLIC : Networks.TESTNET
@@ -176,25 +206,18 @@ export function useSearch(walletAddress: string | null = null) {
       // Flow step 1 — initial request, expect 402
       advance(1)
       console.log('🚀 Initial request:', `${SERVER_URL}/search?${params}`)
-      const firstRes = await fetch(`${SERVER_URL}/search?${params}`)
+      const firstRes = await fetch(`${SERVER_URL}/search?${params}`, {
+        signal: activePayment.controller.signal,
+      })
+      throwIfCancelled()
       console.log('📡 Status:', firstRes.status)
 
       if (firstRes.status !== 402) {
         if (!firstRes.ok) throw new Error(`Server error ${firstRes.status}`)
-        const data = (await firstRes.json()) as SearchResponse
+        const data = await firstRes.json()
         return setSession({
-          query: data.executedQuery ?? data.query ?? query,
-          originalQuery: data.originalQuery ?? query,
-          executedQuery: data.executedQuery ?? data.query ?? query,
-          suggestedQuery: data.suggestedQuery,
-          isCorrected: data.isCorrected ?? false,
-          results: data.results ?? [],
-          txHash: null,
-          paidAmount: null,
-          status: 'complete',
-          step: 6,
-          durationMs: Date.now() - t0,
-          suggestions: data.suggestions ?? [],
+          query, results: data.results ?? [], txHash: null,
+          paidAmount: null, status: 'complete', step: 6, durationMs: Date.now() - t0, suggestions: data.suggestions ?? [], peopleAlsoAsk: data.peopleAlsoAsk ?? [],
         })
       }
 
@@ -210,6 +233,7 @@ export function useSearch(walletAddress: string | null = null) {
       advance(3)
       console.log('🔐 Triggering Freighter popup via createPaymentPayload...')
       const paymentPayload = await client.createPaymentPayload(paymentRequired)
+      throwIfCancelled()
       console.log('✅ Freighter approved, payload created')
 
       const paymentHeaders = httpClient.encodePaymentSignatureHeader(paymentPayload)
@@ -220,11 +244,13 @@ export function useSearch(walletAddress: string | null = null) {
       console.log('🔄 Retrying with payment...')
       const paidResPromise = fetch(`${SERVER_URL}/search?${params}`, {
         headers: paymentHeaders,
+        signal: activePayment.controller.signal,
       })
 
       // Flow step 5 — facilitator settles on Stellar while the retry is in flight
       advance(5)
       const paidRes = await paidResPromise
+      throwIfCancelled()
       console.log('📡 Paid response status:', paidRes.status)
 
       if (!paidRes.ok) {
@@ -232,46 +258,51 @@ export function useSearch(walletAddress: string | null = null) {
         throw new Error(`Payment failed: server returned ${paidRes.status} — ${text}`)
       }
 
-      const data = (await paidRes.json()) as SearchResponse
+      const data = await paidRes.json()
       console.log('✅ Search complete!')
+
+      const paymentResponseHeader = paidRes.headers.get('PAYMENT-RESPONSE') || paidRes.headers.get('x-payment-response')
+      const paymentResponse: any = paymentResponseHeader
+        ? (typeof (httpClient as any).parsePaymentResponseHeader === 'function'
+            ? (httpClient as any).parsePaymentResponseHeader(paymentResponseHeader)
+            : paymentResponseHeader)
+        : null
+      const txHash = data.txHash || paymentResponse?.transactionHash || null
+      const paidAmount = data.paidAmount || paymentResponse?.amount || null
 
       // Flow step 6 — result received and rendered
       setSession({
-        query:        data.executedQuery ?? data.query ?? query,
-        originalQuery: data.originalQuery ?? query,
-        executedQuery: data.executedQuery ?? data.query ?? query,
-        suggestedQuery: data.suggestedQuery,
-        isCorrected:  data.isCorrected ?? false,
-        results:      data.results    ?? [],
-        txHash:       data.txHash     ?? null,
-        paidAmount:   data.paidAmount ?? null,
-        status:       'complete',
-        step:         6,
-        durationMs:   Date.now() - t0,
-        suggestions:  data.suggestions ?? [],
+        query,
+        results:     data.results    ?? [],
+        txHash:      txHash,
+        paidAmount:  paidAmount,
+        status:      'complete',
+        step:        6,
+        durationMs:  Date.now() - t0,
+        suggestions: data.suggestions ?? [],
+        peopleAlsoAsk: data.peopleAlsoAsk ?? [],
       })
 
-      if (data.txHash) {
-        const settledTxHash = data.txHash
-        toast.success(`Payment settled: ${data.paidAmount || '0.001'} USDC`, {
+      if (txHash) {
+        toast.success(`Payment settled: ${paidAmount || '0.001'} USDC`, {
           description: 'View transaction on Stellar network',
           action: {
             label: 'Explorer',
-            onClick: () => window.open(explorerTxUrl(settledTxHash), '_blank')
+            onClick: () => window.open(explorerTxUrl(txHash), '_blank')
           }
         })
       }
 
       // Persist receipt
-      if (data.txHash) {
+      if (txHash) {
         try {
           const receiptsRaw = localStorage.getItem('stellarsearch_receipts')
           const receipts: SearchReceipt[] = receiptsRaw ? JSON.parse(receiptsRaw) : []
           
           const newReceipt: SearchReceipt = {
-            txHash: data.txHash,
+            txHash: txHash,
             query: query.trim(),
-            amount: data.paidAmount || '0.001',
+            amount: paidAmount || '0.001',
             timestamp: new Date().toISOString(),
             network: data.network || 'stellar:testnet',
           }
@@ -286,31 +317,25 @@ export function useSearch(walletAddress: string | null = null) {
       }
 
     } catch (err: any) {
+      if (activePayment.cancelled) return
       console.error('❌ Search failed:', err)
       const msg = err.message || 'Search failed.'
       toast.error('Search Payment Failed', { description: msg })
-      setSession((prev: SearchSession) => ({
+      setSession(prev => ({
         ...prev,
         status: 'error',
         error:  msg,
       }))
+    } finally {
+      if (activePaymentRef.current === activePayment) {
+        activePaymentRef.current = null
+      }
     }
-  }, [walletAddress])
+  }, [walletAddress, walletNetwork])
 
   const reset = useCallback(() => {
-    setSession({
-      query: '',
-      originalQuery: '',
-      executedQuery: '',
-      suggestedQuery: undefined,
-      isCorrected: false,
-      results: [],
-      txHash: null,
-      paidAmount: null,
-      status: 'idle',
-      suggestions: [],
-    })
+    setSession({ query: '', results: [], txHash: null, paidAmount: null, status: 'idle', suggestions: [], peopleAlsoAsk: [] })
   }, [])
 
-  return { session, search, reset }
+  return { session, search, reset, cancel } as const
 }
